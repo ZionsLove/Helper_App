@@ -22,6 +22,8 @@ part 'HVACScreen.dart';
 //com.example.apprentice_app
 //C7:C8:50:2F:DD:1F:8A:51:43:7A:58:00:E0:57:E4:F8:73:00:77:61
 
+//Jesus Christ is The Way
+
 const double minDeliveryFee = 17.0;
 const double taxRate = 0.08875;
 
