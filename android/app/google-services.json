@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "950440205801",
+    "project_id": "apprenticeapp-1aea3",
+    "storage_bucket": "apprenticeapp-1aea3.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:950440205801:android:17a274c387e90a2d74ff78",
+        "android_client_info": {
+          "package_name": "com.example.apprentice_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBSb3fmeHtZQ-vJw3n7EotgmUK534HRwfE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
