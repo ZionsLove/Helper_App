@@ -149,7 +149,7 @@ class _HVACScreenState extends State<HVACScreen> {
       "categories": ["HVAC Hoses", "HVAC Service", "Vacuum"],
     },
     {
-      "name": "Vacuum Pump Oil (1 Gallon),
+      "name": "Vacuum Pump Oil (1 Gallon)",
       "price": 45.00,
       "description": "1 gallon of oil to lubricate vacuum pump (Brand may vary)",
       "image": "assets/images/VacuumPumpOil(1Gallon).jpg",
