@@ -173,7 +173,7 @@ class _HVACScreenState extends State<HVACScreen> {
       "name": "Copper Brazing Rods",
       "price": 35.00,
       "description": "Rods used for brazing copper (Brand may vary)",
-      "image": "assets/images/BrazingRods.jpg",
+      "image": "assets/images/CopperBrazingRods.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
@@ -254,7 +254,7 @@ class _HVACScreenState extends State<HVACScreen> {
       "categories": ["HVAC Service", "Brazing"],
     },
     {
-      "name": "Residential AC Compressor",
+      "name": "Residential Hermetic AC Compressor",
       "price": 425.00,
       "description":
           "Special order replacement compressor. Select matching system specifications before adding.",
