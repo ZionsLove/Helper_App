@@ -266,6 +266,7 @@ class _HVACScreenState extends State<HVACScreen> {
         "Voltage": ["208/230V", "460V"],
         "Phase": ["Single Phase", "Three Phase"],
         "Refrigerant": ["R-410A", "R-32", "R-454B"],
+        "Suction / Liquid Line Size": ["5/8 in. x 1/4 in.", "3/4 in. x 3/8 in.", "7/8 in. x 3/8 in.", "1 1/8 in. x 3/8 in.", "Unknown - match existing unit"],
       },
     },
     {
