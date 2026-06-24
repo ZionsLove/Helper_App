@@ -25,147 +25,168 @@ class _HVACScreenState extends State<HVACScreen> {
     {
       "name": "Condenser Coil Cleaner (1 Gallon)",
       "price": 50.00,
-      "description": "Undiluted chemical for cleaning outdoor condenser coils (Brand may vary)",
+      "description":
+          "Undiluted chemical for cleaning outdoor condenser coils (Brand may vary)",
       "image": "assets/images/CondenserCoilCleaner.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Evaporator Coil Cleaner (1 Gallon)",
       "price": 50.00,
-      "description": "Undiluted chemical for cleaning indoor condenser coils (Brand may vary)",
+      "description":
+          "Undiluted chemical for cleaning indoor condenser coils (Brand may vary)",
       "image": "assets/images/Non-RinseEvaporatorCoilCleaner.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Coil Cleaning Brush",
       "price": 5.00,
-      "description": "Firm bristle brush for removing dirt layers from coils (Brand may vary)",
+      "description":
+          "Firm bristle brush for removing dirt layers from coils (Brand may vary)",
       "image": "assets/images/CoilCleaningBrush.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Evaporator Coil Cleaner (1 Gallon)",
       "price": 50.00,
-      "description": "Undiluted chemical for cleaning indoor condenser coils (Brand may vary)",
+      "description":
+          "Undiluted chemical for cleaning indoor condenser coils (Brand may vary)",
       "image": "assets/images/Non-RinseEvaporatorCoilCleaner.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Standard 1/4 in. Yellow Hose",
       "price": 50.00,
-      "description": "Yellow hose with no valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Yellow hose with no valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/StandardYellowHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Standard 1/4 in. Red Hose",
       "price": 50.00,
-      "description": "Red hose with no valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Red hose with no valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/StandardRedHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Standard 1/4 in. Blue Hose",
       "price": 50.00,
-      "description": "Blue hose with no valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Blue hose with no valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/StandardBlueHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "1/4 in. Yellow Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Yellow hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Yellow hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/DepresserYellowHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "1/4 in. Red Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Red hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Red hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/DepresserRedHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "1/4 in. Blue Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Blue hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Blue hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/DepresserBlueHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Low-Loss 1/4 in. Yellow Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Yellow Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Yellow Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/LowLossYellowHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Low-Loss 1/4 in. Red Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Red Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Red Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/LowLossRedHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Low-Loss 1/4 in. Blue Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Blue Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Blue Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/LowLossBlueHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Low-Loss 1/4 in. Blue Hose With Valve Core Depresser",
       "price": 50.00,
-      "description": "Blue Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
+      "description":
+          "Blue Low-Loss fitting hose with valve core depressers for servicing air conditioner (Brand may vary)",
       "image": "assets/images/LowLossBlueHose.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Refrigerant Hose 1 1/4 in. Gaskets (Pack of 10)",
       "price": 7.00,
-      "description": "Rubber gaskets to replace existing ones that are damaged or leaking on a standard size refrigerant hose (Brand may vary)",
+      "description":
+          "Rubber gaskets to replace existing ones that are damaged or leaking on a standard size refrigerant hose (Brand may vary)",
       "image": "assets/images/RefrigerantHoseGaskets.jpg",
       "categories": ["HVAC Hoses", "HVAC Service"],
     },
     {
       "name": "Schrader Valve",
       "price": 5.00,
-      "description": "Replacement valve for air conditioner service port/sensors. Pack of 4-10 depending on stock (Brand may vary)",
+      "description":
+          "Replacement valve for air conditioner service port/sensors. Pack of 4-10 depending on stock (Brand may vary)",
       "image": "assets/images/SchraderValve.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Vacuum Hose (1/2 in)",
       "price": 45.00,
-      "description": "1/2 in. vacuum hose for faster vacuuming (Brand may vary)",
+      "description":
+          "1/2 in. vacuum hose for faster vacuuming (Brand may vary)",
       "image": "assets/images/VacuumHose(.5in).jpg",
       "categories": ["HVAC Hoses", "HVAC Service", "Vacuum"],
     },
     {
       "name": "Vacuum Hose (3/8 in)",
       "price": 45.00,
-      "description": "3/8 in. vacuum hose for faster vacuuming (Brand may vary)",
+      "description":
+          "3/8 in. vacuum hose for faster vacuuming (Brand may vary)",
       "image": "assets/images/VacuumHose(.5in).jpg",
       "categories": ["HVAC Hoses", "HVAC Service", "Vacuum"],
     },
     {
       "name": "Vacuum Pump Oil (1 Gallon)",
       "price": 45.00,
-      "description": "1 gallon of oil to lubricate vacuum pump (Brand may vary)",
+      "description":
+          "1 gallon of oil to lubricate vacuum pump (Brand may vary)",
       "image": "assets/images/VacuumPumpOil(1Gallon).jpg",
       "categories": ["HVAC Hoses", "HVAC Service", "Vacuum"],
     },
     {
       "name": "Nitrogen Regulator",
       "price": 170.00,
-      "description": "Adjustable valve for regulating nitrogen pressure from nitrogen tank (Brand may vary)",
+      "description":
+          "Adjustable valve for regulating nitrogen pressure from nitrogen tank (Brand may vary)",
       "image": "assets/images/NitrogenRegulator.jpg",
       "categories": ["HVAC Service"],
     },
     {
       "name": "Leak Detector Spray",
       "price": 20.00,
-      "description": "Mixture that bubbles to find detect leak (Brand may vary)",
+      "description":
+          "Mixture that bubbles to find detect leak (Brand may vary)",
       "image": "assets/images/LeakDetectorSpray.jpg",
       "categories": ["HVAC Service"],
     },
@@ -179,77 +200,88 @@ class _HVACScreenState extends State<HVACScreen> {
     {
       "name": "Silver Brazing Rods",
       "price": 35.00,
-      "description": "Rods used for brazing copper to brass/steel/stainless steel (Brand may vary)",
+      "description":
+          "Rods used for brazing copper to brass/steel/stainless steel (Brand may vary)",
       "image": "assets/images/BrazingRods.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "Sparker",
       "price": 7.00,
-      "description": "Tool for creating spark to ignite flame torch (Brand may vary)",
+      "description":
+          "Tool for creating spark to ignite flame torch (Brand may vary)",
       "image": "assets/images/Sparker.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "Turbo Torch",
       "price": 7.00,
-      "description": "Torch with extreme heat for brazing not soldering (Brand may vary)",
+      "description":
+          "Torch with extreme heat for brazing not soldering (Brand may vary)",
       "image": "assets/images/TurboTorch.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "Heavy Futy Flaring Tool (3/16 in. to 3/4 in.)",
       "price": 170.00,
-      "description": "Tool used to make flare on pipe to fasten nut to threaded fitting (Brand may vary)",
+      "description":
+          "Tool used to make flare on pipe to fasten nut to threaded fitting (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "Pipe Bending Kit",
       "price": 170.00,
-      "description": "Tool used to make flare on pipe to fasten nut to threaded fitting (Brand may vary)",
+      "description":
+          "Tool used to make flare on pipe to fasten nut to threaded fitting (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "208/230V to 24V 75VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "208/230V to 24V 50VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "208/230V to 24V 40VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "120V to 24V 75VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "120V to 24V 50VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
       "name": "120V to 24V 40VA Transformer",
       "price": 170.00,
-      "description": "Transformer used to step down from 208/230V to 24V (Brand may vary)",
+      "description":
+          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
       "image": "assets/images/FlaringTool.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
@@ -261,25 +293,42 @@ class _HVACScreenState extends State<HVACScreen> {
       "image": "assets/images/hvac_compressor.jpg",
       "categories": ["Specialty", "Refrigerant"],
       "isSpecialty": true,
+      requiresCarDeliveryKey: true,
       "specs": {
-        "Tonnage": ["1.5 Ton", "2 Ton", "2.5 Ton", "3 Ton", "3.5 Ton", "4 Ton", "5 Ton"],
+        "Tonnage": [
+          "1.5 Ton",
+          "2 Ton",
+          "2.5 Ton",
+          "3 Ton",
+          "3.5 Ton",
+          "4 Ton",
+          "5 Ton",
+        ],
         "Voltage": ["208/230V", "460V"],
         "Phase": ["Single Phase", "Three Phase"],
         "Refrigerant": ["R-410A", "R-32", "R-454B"],
-        "Suction / Liquid Line Size": ["5/8 in. x 1/4 in.", "3/4 in. x 3/8 in.", "7/8 in. x 3/8 in.", "1 1/8 in. x 3/8 in.", "Unknown - match existing unit"],
+        "Suction / Liquid Line Size": [
+          "5/8 in. x 1/4 in.",
+          "3/4 in. x 3/8 in.",
+          "7/8 in. x 3/8 in.",
+          "1 1/8 in. x 3/8 in.",
+          "Unknown - match existing unit",
+        ],
       },
     },
     {
       "name": "16 x 25 x 1 Pleated Air Filter",
       "price": 12.00,
-      "description": "Standard pleated return air filter. MERV rating may vary.",
+      "description":
+          "Standard pleated return air filter. MERV rating may vary.",
       "image": "assets/images/hvac_air_filter_16x25x1.jpg",
       "categories": ["Filters"],
     },
     {
       "name": "20 x 20 x 1 Pleated Air Filter",
       "price": 13.00,
-      "description": "Disposable pleated HVAC filter for common residential returns.",
+      "description":
+          "Disposable pleated HVAC filter for common residential returns.",
       "image": "assets/images/hvac_air_filter_20x20x1.jpg",
       "categories": ["Filters"],
     },
@@ -293,28 +342,32 @@ class _HVACScreenState extends State<HVACScreen> {
     {
       "name": "Programmable Thermostat",
       "price": 58.00,
-      "description": "Programmable thermostat for scheduled heating and cooling.",
+      "description":
+          "Programmable thermostat for scheduled heating and cooling.",
       "image": "assets/images/hvac_programmable_thermostat.jpg",
       "categories": ["Thermostats"],
     },
     {
       "name": "40/5 MFD Dual Run Capacitor",
       "price": 21.00,
-      "description": "Dual run capacitor for condenser fan and compressor circuits.",
+      "description":
+          "Dual run capacitor for condenser fan and compressor circuits.",
       "image": "assets/images/hvac_dual_run_capacitor.jpg",
       "categories": ["Capacitors"],
     },
     {
       "name": "45/5 MFD Dual Run Capacitor",
       "price": 23.00,
-      "description": "Common replacement dual run capacitor. Voltage rating may vary.",
+      "description":
+          "Common replacement dual run capacitor. Voltage rating may vary.",
       "image": "assets/images/hvac_dual_run_capacitor_45_5.jpg",
       "categories": ["Capacitors"],
     },
     {
       "name": "1/4 HP Condenser Fan Motor",
       "price": 96.00,
-      "description": "Replacement condenser fan motor. Rotation and voltage may vary.",
+      "description":
+          "Replacement condenser fan motor. Rotation and voltage may vary.",
       "image": "assets/images/hvac_condenser_fan_motor.jpg",
       "categories": ["Motors"],
     },
@@ -370,14 +423,16 @@ class _HVACScreenState extends State<HVACScreen> {
     {
       "name": "Fin Comb Set",
       "price": 9.00,
-      "description": "Plastic fin comb set for straightening condenser coil fins.",
+      "description":
+          "Plastic fin comb set for straightening condenser coil fins.",
       "image": "assets/images/hvac_fin_comb.jpg",
       "categories": ["Tools"],
     },
     {
       "name": "Digital Multimeter",
       "price": 36.00,
-      "description": "General purpose multimeter for HVAC electrical troubleshooting.",
+      "description":
+          "General purpose multimeter for HVAC electrical troubleshooting.",
       "image": "assets/images/hvac_multimeter.jpg",
       "categories": ["Tools"],
     },
@@ -512,9 +567,8 @@ class _HVACScreenState extends State<HVACScreen> {
                             Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (context) => HVACSpecialtyDetailScreen(
-                                  item: item,
-                                ),
+                                builder: (context) =>
+                                    HVACSpecialtyDetailScreen(item: item),
                               ),
                             );
                           } else {
@@ -554,8 +608,9 @@ class _HVACScreenState extends State<HVACScreen> {
                                         ),
                                         decoration: BoxDecoration(
                                           color: Colors.orange.shade100,
-                                          borderRadius:
-                                              BorderRadius.circular(20),
+                                          borderRadius: BorderRadius.circular(
+                                            20,
+                                          ),
                                           border: Border.all(
                                             color: Colors.orange.shade700,
                                           ),

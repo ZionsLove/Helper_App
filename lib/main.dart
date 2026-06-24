@@ -9,6 +9,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'firebase_options.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'confirm_location_screen.dart';
@@ -26,6 +27,8 @@ part 'HVACScreen.dart';
 
 const double minDeliveryFee = 17.0;
 const double taxRate = 0.08875;
+const String requiresCarDeliveryKey = "requiresCarDelivery";
+const Set<String> motorVehicleTypes = {"car", "pickup_truck_van"};
 
 Future<Position?> requestLocation() async {
   bool serviceEnabled;
@@ -94,9 +97,19 @@ Future<Map<String, dynamic>?> findClosestStore(Position userPosition) async {
   return closestStore;
 }
 
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
+final GlobalKey<ScaffoldMessengerState> appScaffoldMessengerKey =
+    GlobalKey<ScaffoldMessengerState>();
+
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
   // 🔥 STEP 1 — ADD YOUR PUBLISHABLE KEY HERE
   if (!kIsWeb) {
@@ -104,7 +117,117 @@ void main() async {
         "pk_test_51TQWNvROBLc14B5hkhpybYHZ2wQSL6MjKJynFQsRkl1fsMMCniENxjgz3ZNTkTR3ByhTXoUzau9EI56QWEiPsxoW00LrgMgzp4";
   }
 
+  await PushNotificationService.setup();
+
   runApp(MyApp());
+}
+
+class PushNotificationService {
+  static final FirebaseMessaging _messaging = FirebaseMessaging.instance;
+
+  static Future<void> setup() async {
+    if (kIsWeb) return;
+
+    await _messaging.requestPermission(alert: true, badge: true, sound: true);
+
+    FirebaseAuth.instance.authStateChanges().listen((user) async {
+      if (user == null) return;
+      await saveCurrentToken(user.uid);
+    });
+
+    FirebaseMessaging.instance.onTokenRefresh.listen((token) async {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) return;
+      await saveToken(user.uid, token);
+    });
+
+    FirebaseMessaging.onMessage.listen(showForegroundMessage);
+    FirebaseMessaging.onMessageOpenedApp.listen(handleNotificationTap);
+
+    final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+    if (initialMessage != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        handleNotificationTap(initialMessage);
+      });
+    }
+  }
+
+  static Future<void> saveCurrentToken(String userId) async {
+    final token = await _messaging.getToken();
+    if (token == null || token.isEmpty) return;
+    await saveToken(userId, token);
+  }
+
+  static Future<void> saveToken(String userId, String token) async {
+    final userRef = FirebaseFirestore.instance.collection('users').doc(userId);
+
+    await userRef.set({
+      'fcmToken': token,
+      'fcmTokens': FieldValue.arrayUnion([token]),
+    }, SetOptions(merge: true));
+
+    final userDoc = await userRef.get();
+    final data = userDoc.data();
+
+    if (data?['role'] == 'driver') {
+      await FirebaseFirestore.instance.collection('drivers').doc(userId).set({
+        'fcmToken': token,
+        'fcmTokens': FieldValue.arrayUnion([token]),
+      }, SetOptions(merge: true));
+    }
+  }
+
+  static void showForegroundMessage(RemoteMessage message) {
+    final title = message.notification?.title ?? message.data['title'];
+    final body = message.notification?.body ?? message.data['body'];
+
+    if (title == null && body == null) return;
+
+    final messenger = appScaffoldMessengerKey.currentState;
+    if (messenger == null) return;
+
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        duration: Duration(seconds: 4),
+        showCloseIcon: true,
+        content: InkWell(
+          onTap: () {
+            messenger.hideCurrentSnackBar();
+            handleNotificationTap(message);
+          },
+          child: Padding(
+            padding: EdgeInsets.symmetric(vertical: 4),
+            child: Text(
+              body == null ? title.toString() : "${title ?? 'Update'}\n$body",
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  static void handleNotificationTap(RemoteMessage message) {
+    final data = message.data;
+    final type = data['type'];
+    final orderId = data['orderId'];
+    final navigator = appNavigatorKey.currentState;
+
+    if (navigator == null) return;
+
+    if (type == 'customer_order_update' && orderId is String) {
+      navigator.push(
+        MaterialPageRoute(
+          builder: (_) => CustomerOrderTrackingScreen(orderId: orderId),
+        ),
+      );
+      return;
+    }
+
+    if (type == 'driver_new_order') {
+      navigator.push(MaterialPageRoute(builder: (_) => DriverScreen()));
+    }
+  }
 }
 
 typedef AddToCart = void Function(int quantity);
@@ -112,7 +235,12 @@ typedef AddToCart = void Function(int quantity);
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(title: 'Plumbing Parts', home: SplashScreen());
+    return MaterialApp(
+      title: 'Plumbing Parts',
+      navigatorKey: appNavigatorKey,
+      scaffoldMessengerKey: appScaffoldMessengerKey,
+      home: SplashScreen(),
+    );
   }
 }
 
@@ -121,6 +249,8 @@ class CartItem {
   final double price;
   final String image;
   final String description;
+  final String? specialtyStoreTag;
+  final bool requiresCarDelivery;
   int quantity;
 
   CartItem({
@@ -128,12 +258,25 @@ class CartItem {
     required this.price,
     required this.image,
     required this.description,
+    this.specialtyStoreTag,
+    this.requiresCarDelivery = false,
     this.quantity = 1,
   });
 
   Map<String, dynamic> toJson() {
-    return {'name': name, 'price': price, 'image': image, 'quantity': quantity};
+    return {
+      'name': name,
+      'price': price,
+      'image': image,
+      'quantity': quantity,
+      'specialtyStoreTag': specialtyStoreTag,
+      requiresCarDeliveryKey: requiresCarDelivery,
+    };
   }
+}
+
+bool cartRequiresCarDelivery(List<CartItem> cart) {
+  return cart.any((item) => item.requiresCarDelivery);
 }
 
 class Order {
@@ -160,6 +303,7 @@ class Order {
           "quantity": item.quantity,
           "status": status,
           "description": item.description,
+          requiresCarDeliveryKey: item.requiresCarDelivery,
         };
       }).toList(),
       "total": total,
@@ -177,6 +321,7 @@ class Order {
           image: item["image"],
           quantity: (item["quantity"] ?? 1),
           description: item["description"] ?? "",
+          requiresCarDelivery: item[requiresCarDeliveryKey] == true,
         );
       }).toList(),
       total: json["total"],
@@ -629,6 +774,9 @@ class _CartScreenState extends State<CartScreen> {
                           price: (data["price"] as num).toDouble(),
                           image: data["image"],
                           description: data["description"],
+                          specialtyStoreTag: data["specialtyStoreTag"],
+                          requiresCarDelivery:
+                              data[requiresCarDeliveryKey] == true,
                           quantity: (data["quantity"] ?? 1) as int,
                         );
                       }).toList();
@@ -710,6 +858,74 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   void initState() {
     super.initState();
     loadPaymentMethod();
+  }
+
+  Future<void> addPaymentMethod() async {
+    if (isAddingPaymentMethod || paymentMethods.length >= 5) return;
+
+    setState(() => isAddingPaymentMethod = true);
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'createSetupIntent',
+      );
+      final response = await callable.call();
+      final clientSecret = response.data['clientSecret'] as String?;
+
+      if (clientSecret == null || clientSecret.isEmpty) {
+        throw StateError("Stripe setup did not return a client secret.");
+      }
+
+      await stripe.Stripe.instance.initPaymentSheet(
+        paymentSheetParameters: stripe.SetupPaymentSheetParameters(
+          setupIntentClientSecret: clientSecret,
+          merchantDisplayName: 'Apprentice App',
+        ),
+      );
+
+      await stripe.Stripe.instance.presentPaymentSheet();
+      await loadPaymentMethod();
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Payment method added")));
+    } on stripe.StripeException catch (error) {
+      if (!mounted) return;
+
+      final message =
+          error.error.localizedMessage ??
+          "Stripe could not add this payment method.";
+
+      if (message.toLowerCase().contains("cancel")) return;
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } on FirebaseFunctionsException catch (error) {
+      if (!mounted) return;
+
+      final message = error.code == "failed-precondition"
+          ? "Payment setup is temporarily unavailable. Stripe is not configured on the server."
+          : error.message ?? "Could not start payment setup.";
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } catch (error) {
+      debugPrint("Add payment method error: $error");
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Could not add payment method. Please try again."),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => isAddingPaymentMethod = false);
+      }
+    }
   }
 
   Future<void> loadPaymentMethod() async {
@@ -900,10 +1116,1059 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
     }
   }
 
+  final List<Map<String, dynamic>> manualTradeStores = [
+    // Add stores here when you want checkout to prefer a known supplier.
+    // Example:
+    // {
+    //   "id": "ferguson-downtown",
+    //   "storeName": "Ferguson Plumbing Supply",
+    //   "tradeType": "Plumbing",
+    //   "lat": 40.7128,
+    //   "lng": -74.0060,
+    //   "address": "Store address here",
+    //   "specialtyTags": ["propress", "noHub", "blackIron"],
+    // },
+    //BRONX
+    {
+      "id": "allparts-plumbing+heating",
+      "storeName": "All Parts Plumbing and Heating Supplies",
+      "tradeType": "Plumbing", //HVAC
+      "lat": 40.891181,
+      "lng": -73.850857,
+      "address": "920 E 233rd St, Bronx, NY 10466",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "fwwebb-bronx",
+      "storeName": "F.W. Webb Company - Bronx",
+      "tradeType": "Plumbing", //HVAC
+      "lat": 40.820117,
+      "lng": -73.892596,
+      "address": "919 Southern Blvd, Bronx, NY 10459",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "gunhill-plumbing",
+      "storeName": "Gunhill Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.877085,
+      "lng": -73.867263,
+      "address": "3463 White Plains Rd, Bronx, NY 10467",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "h&h-hardware",
+      "storeName": "H & H Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.831501,
+      "lng": -73.851128,
+      "address": "1711 Castle Hill Ave, Bronx, NY 10462",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "homedepot-exterior",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.823992,
+      "lng": -73.929745,
+      "address": "600 Exterior St, Bronx, NY 10451",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "levins-supply",
+      "storeName": "Levin's Crosstown Supply Corporation",
+      "tradeType": "Plumbing",
+      "lat": 40.832300,
+      "lng": -73.899068,
+      "address": "1347 Boston Rd, Bronx, NY 10456",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "mikespipeyard&plumbing",
+      "storeName": "Mike's Pipe Yard & Plumbing",
+      "tradeType": "Plumbing",
+      "lat": 40.867101,
+      "lng": -73.860049,
+      "address": "2816 Boston Rd, Bronx, NY 10469",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "monarch-supply",
+      "storeName": "Monarch Supply Corporation",
+      "tradeType": "Plumbing",
+      "lat": 40.810846,
+      "lng": -73.883834,
+      "address": "1335 Oak Point Ave, Bronx, NY 10474",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "pelhambay-homecenter",
+      "storeName": "Pelham Bay Home Center",
+      "tradeType": "Plumbing",
+      "lat": 40.849079,
+      "lng": -73.830809,
+      "address": "3073 Westchester Ave, Bronx, NY 10461",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "ranger-supply",
+      "storeName": "Ranger Supply Company Inc.",
+      "tradeType": "Plumbing",
+      "lat": 40.879375,
+      "lng": -73.901773,
+      "address": "3137 Bailey Ave, Bronx, NY 10463",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "rim-supply",
+      "storeName": "RIM Plumbing & Heating Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.817894,
+      "lng": -73.862783,
+      "address": "623 Soundview Ave, Bronx, NY 10473",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "shyman-plumbing",
+      "storeName": "S Hyman Plumbing Supplies",
+      "tradeType": "Plumbing",
+      "lat": 40.839159,
+      "lng": -73.904260,
+      "address": "432 Claremont Pkwy, Bronx, NY 10457",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "washington-plumbingspecco",
+      "storeName": "Washington Plumbing Spec Co",
+      "tradeType": "Plumbing",
+      "lat": 40.848642,
+      "lng": -73.894798,
+      "address": "4290 3rd Ave, Bronx, NY 10457",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "webster-plumbing",
+      "storeName": "Webster Plumbing Supply Inc",
+      "tradeType": "Plumbing",
+      "lat": 40.85267,
+      "lng": -73.901968,
+      "address": "1758 Webster Ave, Bronx, NY 10457",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    //BROOKLYN
+    {
+      "id": "apex-plumbing",
+      "storeName": "Apex Plumbing Supply Corporation",
+      "tradeType": "Plumbing",
+      "lat": 40.637390,
+      "lng": -73.968450,
+      "address": "822 Coney Island Ave, Brooklyn, NY 11218",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "bmwplumbingsupply",
+      "storeName": "Bmw Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.703927,
+      "lng": -73.933832,
+      "address": "232 Varet St, Brooklyn, NY 11206",
+      "specialtyTags": ["propress", "noHub", "blackIron", "pvc"],
+    },
+    {
+      "id": "brooklynplumbing+heating",
+      "storeName": "Brooklyn Plumbing & Heating Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.627455,
+      "lng": -73.941737,
+      "address": "1747 Flatbush Ave, Brooklyn, NY 11210",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "charliej-plumbing",
+      "storeName": "Charlie J Plumbing & Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.678690,
+      "lng": -73.888467,
+      "address": "2878 Fulton St, Brooklyn, NY 11207",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "ferguson-3rdave",
+      "storeName": "Ferguson",
+      "tradeType": "Plumbing",
+      "lat": 40.646495,
+      "lng": -74.016258,
+      "address": "5202 3rd Ave, Brooklyn, NY 11220",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "ferguson-18thave",
+      "storeName": "Ferguson",
+      "tradeType": "Plumbing",
+      "lat": 40.602919,
+      "lng": -74.006587,
+      "address": "8805 18th Ave, Brooklyn, NY 11214",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "grainger-sunsetpark",
+      "storeName": "Grainger Industrial Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.659646,
+      "lng": -74.001743,
+      "address": "815 3rd Ave, Brooklyn, NY 11232",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-norstrand",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.691961,
+      "lng": -73.952487,
+      "address": "230 Nortstrand Ave, Brooklyn, NY 11205",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-sunsetpark",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.667724,
+      "lng": -73.998208,
+      "address": "550 Hamilton Ave, Brooklyn, NY 11232",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-gatewaydr",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.653874,
+      "lng": -73.868471,
+      "address": "579 Gateway Dr, Brooklyn, NY 11239",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-avenueu",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.612386,
+      "lng": -73.916360,
+      "address": "5700 Avenue U, Brooklyn, NY 11234",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "kevin+richard",
+      "storeName": "Kevin & Richard Plumbing & Heating Supplies",
+      "tradeType": "Plumbing",
+      "lat": 40.722446,
+      "lng": -73.938490,
+      "address": "93 Emerson Pl, Brooklyn, NY 11205",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "lmbuilding+plumbing",
+      "storeName": "L&M BUILDING & PLUMBING SUPPLY INC.",
+      "tradeType": "Plumbing",
+      "lat": 40.722446,
+      "lng": -73.938490,
+      "address": "57 Lombardy St, Brooklyn, NY 11222",
+      "specialtyTags": ["propress", "noHub", "blackIron", "pvc"],
+    },
+    {
+      "id": "muhenhardware+plumbing",
+      "storeName": "Muhen Hardware And Plumbing",
+      "tradeType": "Plumbing",
+      "lat": 40.663433,
+      "lng": -73.924806,
+      "address": "1050 Rutland Rd, Brooklyn, NY 11212",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "parkplumbing+heatingsupply",
+      "storeName": "Park Plumbing & Heating Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.627825,
+      "lng": -73.997251,
+      "address": "1350 60th St, Brooklyn, NY 11219",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "parkslope-plumbing",
+      "storeName": "Park Slope Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.664232,
+      "lng": -73.990269,
+      "address": "601 5th Ave, Brooklyn, NY 11215",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "sunset-plumbing",
+      "storeName": "SUNSET PLUMBING SUPPLY INC.",
+      "tradeType": "Plumbing",
+      "lat": 40.640603,
+      "lng": -74.018295,
+      "address": "6001 4th Ave, Brooklyn, NY 11220",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "williamsburgplumbingsupply",
+      "storeName": "Williamsburg Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.699304,
+      "lng": -73.955751,
+      "address": "485 Flushing Ave, Brooklyn, NY 11205",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "worldwide-plumbing",
+      "storeName": "World Wide Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.637416,
+      "lng": -73.982931,
+      "address": "4002 15th Ave, Brooklyn, NY 11218",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "ysplumbing+heating",
+      "storeName": "YS Plumbing & Heating Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.667688,
+      "lng": -73.953655,
+      "address": "244 Rogers Ave, Brooklyn, NY 11225",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    //MANHATTAN
+    {
+      "id": "73rdst-hardware",
+      "storeName": "73rd Street Hardware, Inc",
+      "tradeType": "Plumbing",
+      "lat": 40.778142,
+      "lng": -73.977947,
+      "address": "65 W 73rd St #1, New York, NY 10023",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "148suppliescorp",
+      "storeName": "148 Supplies Corporation",
+      "tradeType": "Plumbing",
+      "lat": 40.720223,
+      "lng": -73.995029,
+      "address": "148 Elizabeth St, New York, NY 10012",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "acehardware-audubonave",
+      "storeName": "Ace Hardware Audubon Ave",
+      "tradeType": "Plumbing",
+      "lat": 40.845003,
+      "lng": -73.934791,
+      "address": "199 Audubon Ave, New York, NY 10033",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "ajplumbing",
+      "storeName": "AJ Plumbing Supplies",
+      "tradeType": "Plumbing",
+      "lat": 40.717573,
+      "lng": -73.993129,
+      "address": "86 Forsynth St, New York, NY 10002",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "apex-supplycompany",
+      "storeName": "Apex Supply Company, Inc.",
+      "tradeType": "Plumbing",
+      "lat": 40.859998,
+      "lng": -73.930864,
+      "address": "4580 Broadway, New York, NY 10040",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "central-plumbingspecialities",
+      "storeName": "Central Plumbing Specialities",
+      "tradeType": "Plumbing",
+      "lat": 40.787084,
+      "lng": -73.952483,
+      "address": "1250 Park Ave, New York, NY 10029",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "chp-hardware",
+      "storeName": "CHP Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.724462,
+      "lng": -73.978397,
+      "address": "120 Loisada Ave, New York, NY 10009",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "columbus-hardware",
+      "storeName": "Columbus Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.766612,
+      "lng": -73.986231,
+      "address": "842 9th Ave, New York, NY 10019",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "c&s-truevalue",
+      "storeName": "C & S True Value Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.795779,
+      "lng": -73.969346,
+      "address": "788 Amsterdam Ave, New York, NY 10025",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "ferguson-55thst",
+      "storeName": "Ferguson Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.769850,
+      "lng": -73.993471,
+      "address": "625-35 W 55th St, New York, NY 10019",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "firstavenue-supplyhouse",
+      "storeName": "First Avenue Supply House",
+      "tradeType": "Plumbing",
+      "lat": 40.774737,
+      "lng": -73.951165,
+      "address": "1587 1st Ave, New York, NY 10028",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "fwwebb-manhattan",
+      "storeName": "F.W. Webb Company - Manhattan",
+      "tradeType": "Plumbing", //HVAC
+      "lat": 40.742922,
+      "lng": -73.990139,
+      "address": "13 W 24th St, New York, NY 10010",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "fwwebb-westharlem",
+      "storeName": "F.W. Webb Company - West Harlem",
+      "tradeType": "Plumbing", //HVAC
+      "lat": 40.820514,
+      "lng": -73.958802,
+      "address": "2350 12th Ave, New York, NY 10031",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    {
+      "id": "greenwichhardware",
+      "storeName": "GREENWICH HARDWARE",
+      "tradeType": "Plumbing",
+      "lat": 40.736186,
+      "lng": -73.997314,
+      "address": "494 6th Ave, New York, NY 10011",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "homedepot-1stave",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.760517,
+      "lng": -73.961010,
+      "address": "410 E 61st St, New York, NY 10065",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-23rdst",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.741883,
+      "lng": -73.991182,
+      "address": "40 W 23rd St, New York, NY 10010",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "howard-supply",
+      "storeName": "Howard Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.750592,
+      "lng": -73.998083,
+      "address": "344 9th Ave, New York, NY 10001",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "nuthouse-hardware",
+      "storeName": "Nuthouse Hardware",
+      "tradeType": "Plumbing",
+      "lat": 40.742309,
+      "lng": -73.979965,
+      "address": "202 E 29th St, New York, NY 10016",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "unionsquare-supply",
+      "storeName": "Union Square Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.733242,
+      "lng": -73.990141,
+      "address": "130 4th Ave, New York, NY 10003",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "valuecentric-hardware",
+      "storeName": "Value Centric Hardware Inc",
+      "tradeType": "Plumbing",
+      "lat": 40.801043,
+      "lng": -73.935089,
+      "address": "2383 2nd Ave, New York, NY 10035",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+        "turbotorch",
+      ],
+    },
+    //QUEENS
+    {
+      "id": "burtonplumbing+heating",
+      "storeName": "Burton Plumbing & Heating Supply Co",
+      "tradeType": "Plumbing",
+      "lat": 40.727415,
+      "lng": -73.892402,
+      "address": "70-14 Grand Ave, Maspeth, NY 11378",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "coronaplumbing+hvac",
+      "storeName": "Corona Plumbing Heating and Cooling",
+      "tradeType": "Plumbing",
+      "lat": 40.750455,
+      "lng": -73.859308,
+      "address": "104-66 Roosevelt Ave, Corona, NY 11368",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "coronaplumbingsupplyinc",
+      "storeName": "CORONA PLUMBING SUPPLY INC",
+      "tradeType": "Plumbing",
+      "lat": 40.741407,
+      "lng": -73.864109,
+      "address": "50-30 98th St, Corona, NY 11368",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "cypressplumbing+heating",
+      "storeName": "Cypress Plumbing & Heating Supplies",
+      "tradeType": "Plumbing",
+      "lat": 40.683223,
+      "lng": -73.873449,
+      "address": "3304 Fulton St, Brooklyn, NY 11208",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "ferguson-maspeth",
+      "storeName": "Ferguson Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.724691,
+      "lng": -73.921606,
+      "address": "57-22 49th St, Maspeth, NY 11378",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "grainger-queens",
+      "storeName": "Grainger Industrial Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.720180,
+      "lng": -73.909900,
+      "address": "58-45 Grand Ave, Maspeth, NY 11378",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-mauriceave",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.726896,
+      "lng": -73.909314,
+      "address": "59-15 Maurice Ave, Maspeth, NY 11378",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-northernboulevardlic",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.752232,
+      "lng": -73.912160,
+      "address": "50-10 Northern Blvd, Long Island City, NY 11101",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-eastelmhurst",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.763022,
+      "lng": -73.894596,
+      "address": "73-01 25th Ave, East Elmhurst, NY 11370",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-woodhaven",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.708408,
+      "lng": -73.858002,
+      "address": "75-09 Woodhaven Blvd, Glendale, NY 11385",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-flushingavery",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.752671,
+      "lng": -73.835099,
+      "address": "131-35 Avery Ave, Flushing, NY 11355",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-flushing31st",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.767114,
+      "lng": -73.843416,
+      "address": "124-04 31st Ave, Flushing, NY 11354",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-jamaica168st",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.705095,
+      "lng": -73.792765,
+      "address": "92-30 168th St, Jamaica, NY 11433",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "homedepot-rockawayblvd",
+      "storeName": "The Home Depot",
+      "tradeType": "Plumbing",
+      "lat": 40.675951,
+      "lng": -73.826652,
+      "address": "112-20 Rockaway Blvd, South Ozone Park, NY 11420",
+      "specialtyTags": ["propress", "noHub", "blackIron"],
+    },
+    {
+      "id": "libertyplumbing",
+      "storeName": "Liberty Plumbing Supplies",
+      "tradeType": "Plumbing",
+      "lat": 40.697934,
+      "lng": -73.801938,
+      "address": "150-08 Liberty Ave, Jamaica, NY 11435",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "nyplumbingsupply-astoria",
+      "storeName": "NY Plumbing Supply Astoria",
+      "tradeType": "Plumbing",
+      "lat": 40.765871,
+      "lng": -73.915117,
+      "address": "37-08 28th Ave, Astoria, NY 11103",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "soudeshplumbing+heating",
+      "storeName": "Soudesh Plumbing & Heating Supplies Corp",
+      "tradeType": "Plumbing",
+      "lat": 40.713653,
+      "lng": -73.761554,
+      "address": "197-29 Jamaica Ave, Hollis, NY 11423",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "springfieldplumbing+heating",
+      "storeName": "Springfield Plumbing & Heating Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.726009,
+      "lng": -73.740303,
+      "address": "90-41 Springfield Blvd, Queens Villiage, NY 11428",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "superplumbing+building",
+      "storeName": "Super Plumbing & Building Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.725239,
+      "lng": -73.912696,
+      "address": "56-12 58th St, Maspeth, NY 11378",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+    {
+      "id": "queensplumbing",
+      "storeName": "Queens Plumbing Supply",
+      "tradeType": "Plumbing",
+      "lat": 40.745760,
+      "lng": -73.927390,
+      "address": "43-01 37th St, Long Island City, NY 11101",
+      "specialtyTags": [
+        "propress",
+        "noHub",
+        "blackIron",
+        "pvc",
+        "copperFittings",
+      ],
+    },
+  ];
+  //lalamove
+  Map<String, dynamic>? findClosestManualTradeStore(
+    Position position,
+    String tradeType,
+    List<String> specialtyTags,
+  ) {
+    if (specialtyTags.isEmpty) return null;
+
+    final stores = manualTradeStores.where((store) {
+      final storeTags = ((store["specialtyTags"] as List?) ?? [])
+          .map((tag) => tag.toString())
+          .toList();
+
+      final hasMatchingTag = specialtyTags.any(storeTags.contains);
+
+      return store["tradeType"] == tradeType &&
+          store["lat"] != null &&
+          store["lng"] != null &&
+          hasMatchingTag;
+    }).toList();
+
+    if (stores.isEmpty) return null;
+
+    Map<String, dynamic>? closestStore;
+    double? shortestDistance;
+
+    for (final store in stores) {
+      final distance = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        (store["lat"] as num).toDouble(),
+        (store["lng"] as num).toDouble(),
+      );
+
+      if (shortestDistance == null || distance < shortestDistance) {
+        shortestDistance = distance;
+        closestStore = store;
+      }
+    }
+
+    return closestStore;
+  }
+
   Future<Map<String, dynamic>?> findClosestTradeStore(
     Position position,
     String tradeType,
+    List<CartItem> cartItems,
   ) async {
+    final specialtyTags = cartItems
+        .map((item) => item.specialtyStoreTag)
+        .whereType<String>()
+        .toSet()
+        .toList();
+
+    final manualStore = findClosestManualTradeStore(
+      position,
+      tradeType,
+      specialtyTags,
+    );
+
+    if (manualStore != null) {
+      print(
+        "Manual Store Selected: " +
+            (manualStore["storeName"] ?? "Manual Store").toString(),
+      );
+      return manualStore;
+    }
+
     String keyword;
 
     if (tradeType == "Plumbing") {
@@ -972,8 +2237,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 
   Future<List<String>> findNearbyDrivers(
     double customerLat,
-    double customerLng,
-  ) async {
+    double customerLng, {
+    bool requiresCarDelivery = false,
+  }) async {
     final snapshot = await FirebaseFirestore.instance
         .collection('drivers')
         .get();
@@ -986,6 +2252,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
         continue;
       }
       if (data["isBusy"] == true) {
+        continue;
+      }
+      if (requiresCarDelivery &&
+          !motorVehicleTypes.contains(data["vehicleType"])) {
         continue;
       }
 
@@ -1144,45 +2414,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                     child: ElevatedButton(
                       onPressed:
                           (!isAddingPaymentMethod && paymentMethods.length < 5)
-                          ? () async {
-                              setState(() {
-                                isAddingPaymentMethod = true;
-                              });
-
-                              try {
-                                final callable = FirebaseFunctions.instance
-                                    .httpsCallable('createSetupIntent');
-
-                                final response = await callable.call();
-                                final clientSecret =
-                                    response.data['clientSecret'];
-
-                                await stripe.Stripe.instance.initPaymentSheet(
-                                  paymentSheetParameters:
-                                      stripe.SetupPaymentSheetParameters(
-                                        setupIntentClientSecret: clientSecret,
-                                        merchantDisplayName: 'Apprentice App',
-                                      ),
-                                );
-
-                                await stripe.Stripe.instance
-                                    .presentPaymentSheet();
-
-                                await loadPaymentMethod();
-
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text("Payment method added"),
-                                  ),
-                                );
-                              } catch (e) {
-                                print("Error: $e");
-                              } finally {
-                                setState(() {
-                                  isAddingPaymentMethod = false;
-                                });
-                              }
-                            }
+                          ? addPaymentMethod
                           : null,
                       child: isAddingPaymentMethod
                           ? SizedBox(
@@ -1266,6 +2498,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                     await findClosestTradeStore(
                                       position,
                                       widget.tradeType,
+                                      widget.cart,
                                     );
                                 print(
                                   "🏪 Nearest Store: ${closestStore?["storeName"]}",
@@ -1301,6 +2534,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                 final nearbyDrivers = await findNearbyDrivers(
                                   (closestStore["lat"] as num).toDouble(),
                                   (closestStore["lng"] as num).toDouble(),
+                                  requiresCarDelivery: cartRequiresCarDelivery(
+                                    widget.cart,
+                                  ),
                                 );
 
                                 print(
@@ -1339,7 +2575,8 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                 print("💰 PAYMENT SUCCESS");
 
                                 // 🧾 SAVE ORDER
-                                await FirebaseFirestore.instance
+                                final orderRef = await FirebaseFirestore
+                                    .instance
                                     .collection('orders')
                                     .add({
                                       "customerLat": lat,
@@ -1348,6 +2585,7 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                       "customerName":
                                           userData?['name'] ?? "Unknown",
                                       "date": DateTime.now().toIso8601String(),
+                                      "createdAt": FieldValue.serverTimestamp(),
 
                                       "storeLat": closestStore["lat"],
                                       "storeLng": closestStore["lng"],
@@ -1360,7 +2598,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                             (item) => {
                                               "name": item.name,
                                               "price": item.price,
+                                              "image": item.image,
                                               "quantity": item.quantity,
+                                              requiresCarDeliveryKey:
+                                                  item.requiresCarDelivery,
                                             },
                                           )
                                           .toList(),
@@ -1371,10 +2612,24 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                       "total": total,
 
                                       "status": "Pending",
+                                      "dispatchStatus": "queued",
+                                      "dispatchAttempts": 0,
                                       "tradeType": widget.tradeType,
+                                      requiresCarDeliveryKey:
+                                          cartRequiresCarDelivery(widget.cart),
                                       "eligibleDrivers": nearbyDrivers,
                                       "userId": user.uid,
                                     });
+
+                                final savedOrder = await orderRef.get(
+                                  const GetOptions(source: Source.server),
+                                );
+
+                                if (!savedOrder.exists) {
+                                  throw StateError(
+                                    "Order was not confirmed by the server.",
+                                  );
+                                }
 
                                 final result = await Navigator.push(
                                   context,
@@ -1450,6 +2705,586 @@ class OrderSuccessScreen extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class NotificationsScreen extends StatelessWidget {
+  IconData iconForStatus(String status) {
+    switch (status) {
+      case "Accepted":
+        return Icons.check_circle;
+      case "Picked Up":
+        return Icons.inventory_2;
+      case "Delivered":
+        return Icons.done_all;
+      case "Rejected":
+        return Icons.cancel;
+      default:
+        return Icons.receipt_long;
+    }
+  }
+
+  Color colorForStatus(String status) {
+    switch (status) {
+      case "Accepted":
+        return Colors.blue;
+      case "Picked Up":
+        return Colors.orange;
+      case "Delivered":
+        return Colors.green;
+      case "Rejected":
+        return Colors.red;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  String messageForOrder(Map<String, dynamic> order) {
+    final status = order['status'] ?? 'Pending';
+    final storeName = order['storeName'] ?? 'the supply store';
+
+    switch (status) {
+      case "Accepted":
+        return "A driver accepted your order from $storeName.";
+      case "Picked Up":
+        return "Your order was picked up from $storeName.";
+      case "Delivered":
+        return "Your order was delivered.";
+      case "Rejected":
+        return "Your order could not be completed.";
+      default:
+        return "Your order was placed and is waiting for a driver.";
+    }
+  }
+
+  DateTime orderDate(Map<String, dynamic> order) {
+    final createdAt = order['createdAt'];
+    final date = order['date'];
+
+    if (createdAt is Timestamp) {
+      return createdAt.toDate();
+    }
+
+    if (date is String) {
+      return DateTime.tryParse(date) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    }
+
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  String formatDate(DateTime date) {
+    if (date.millisecondsSinceEpoch == 0) return "";
+
+    final hour = date.hour > 12
+        ? date.hour - 12
+        : date.hour == 0
+        ? 12
+        : date.hour;
+    final minute = date.minute.toString().padLeft(2, '0');
+    final period = date.hour >= 12 ? "PM" : "AM";
+
+    return "${date.month}/${date.day}/${date.year} $hour:$minute $period";
+  }
+
+  void openOrderTracker(BuildContext context, String orderId) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CustomerOrderTrackingScreen(orderId: orderId),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      return Scaffold(
+        appBar: AppBar(title: Text("Notifications")),
+        body: Center(child: Text("Log in to view notifications")),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: Text("Notifications")),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('orders')
+            .where('userId', isEqualTo: user.uid)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return Center(child: CircularProgressIndicator());
+          }
+
+          final orders = snapshot.data!.docs.toList();
+
+          orders.sort((a, b) {
+            final aData = a.data() as Map<String, dynamic>;
+            final bData = b.data() as Map<String, dynamic>;
+            return orderDate(bData).compareTo(orderDate(aData));
+          });
+
+          if (orders.isEmpty) {
+            return Center(child: Text("No notifications yet"));
+          }
+
+          return ListView.separated(
+            itemCount: orders.length,
+            separatorBuilder: (context, index) => Divider(height: 1),
+            itemBuilder: (context, index) {
+              final orderDoc = orders[index];
+              final order = orderDoc.data() as Map<String, dynamic>;
+              final status = order['status'] ?? 'Pending';
+              final total = ((order['total'] ?? 0) as num).toDouble();
+              final dateText = formatDate(orderDate(order));
+
+              return ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: colorForStatus(status).withOpacity(0.12),
+                  child: Icon(
+                    iconForStatus(status),
+                    color: colorForStatus(status),
+                  ),
+                ),
+                title: Text(
+                  messageForOrder(order),
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                subtitle: Text(
+                  dateText.isEmpty
+                      ? "Order total: \$${total.toStringAsFixed(2)}"
+                      : "$dateText\nOrder total: \$${total.toStringAsFixed(2)}",
+                ),
+                isThreeLine: dateText.isNotEmpty,
+                trailing: Icon(Icons.map),
+                onTap: () => openOrderTracker(context, orderDoc.id),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class CustomerOrderTrackingScreen extends StatelessWidget {
+  final String orderId;
+
+  CustomerOrderTrackingScreen({required this.orderId});
+
+  Color colorForStatus(String status) {
+    switch (status) {
+      case "Accepted":
+        return Colors.blue;
+      case "Picked Up":
+        return Colors.orange;
+      case "Delivered":
+        return Colors.green;
+      case "Rejected":
+        return Colors.red;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  String trackingMessage(String status, bool hasDriver) {
+    if (!hasDriver) return "Waiting for a driver to accept this order.";
+
+    switch (status) {
+      case "Accepted":
+        return "Driver is heading to the supply store.";
+      case "Picked Up":
+        return "Driver picked up the parts and is heading to you.";
+      case "Delivered":
+        return "This order was delivered.";
+      default:
+        return "Tracking will update when the driver starts moving.";
+    }
+  }
+
+  LatLng? latLngFromOrder(
+    Map<String, dynamic> order,
+    String latKey,
+    String lngKey,
+  ) {
+    final lat = order[latKey];
+    final lng = order[lngKey];
+
+    if (lat is num && lng is num) {
+      return LatLng(lat.toDouble(), lng.toDouble());
+    }
+
+    return null;
+  }
+
+  LatLng? driverLatLng(Map<String, dynamic>? driver) {
+    if (driver == null) return null;
+
+    final lat = driver['lat'];
+    final lng = driver['lng'];
+
+    if (lat is num && lng is num) {
+      return LatLng(lat.toDouble(), lng.toDouble());
+    }
+
+    return null;
+  }
+
+  LatLng mapCenter(LatLng? driver, LatLng? store, LatLng? customer) {
+    return driver ?? store ?? customer ?? LatLng(40.7128, -74.0060);
+  }
+
+  Set<Marker> buildMarkers({
+    required LatLng? driver,
+    required LatLng? store,
+    required LatLng? customer,
+  }) {
+    return {
+      if (driver != null)
+        Marker(
+          markerId: MarkerId("driver"),
+          position: driver,
+          infoWindow: InfoWindow(title: "Driver"),
+          icon: BitmapDescriptor.defaultMarkerWithHue(
+            BitmapDescriptor.hueAzure,
+          ),
+        ),
+      if (store != null)
+        Marker(
+          markerId: MarkerId("store"),
+          position: store,
+          infoWindow: InfoWindow(title: "Supply Store"),
+          icon: BitmapDescriptor.defaultMarkerWithHue(
+            BitmapDescriptor.hueGreen,
+          ),
+        ),
+      if (customer != null)
+        Marker(
+          markerId: MarkerId("customer"),
+          position: customer,
+          infoWindow: InfoWindow(title: "Delivery Address"),
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+        ),
+    };
+  }
+
+  Set<Polyline> buildPolylines({
+    required LatLng? driver,
+    required LatLng? store,
+    required LatLng? customer,
+    required String status,
+  }) {
+    return {
+      if (driver != null && store != null && status == "Accepted")
+        Polyline(
+          polylineId: PolylineId("driverToStore"),
+          points: [driver, store],
+          color: Colors.blue,
+          width: 5,
+        ),
+      if (driver != null && customer != null && status == "Picked Up")
+        Polyline(
+          polylineId: PolylineId("driverToCustomer"),
+          points: [driver, customer],
+          color: Colors.green,
+          width: 5,
+        ),
+      if (store != null && customer != null && status != "Delivered")
+        Polyline(
+          polylineId: PolylineId("storeToCustomer"),
+          points: [store, customer],
+          color: Colors.green.withOpacity(0.25),
+          width: 4,
+        ),
+    };
+  }
+
+  Widget infoTile(IconData icon, String title, String value) {
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: Colors.grey.shade700),
+          SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                ),
+                SizedBox(height: 2),
+                Text(value, style: TextStyle(fontWeight: FontWeight.w600)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget itemImage(String? imagePath) {
+    if (imagePath == null || imagePath.isEmpty) {
+      return Container(
+        width: 48,
+        height: 48,
+        color: Colors.grey.shade200,
+        alignment: Alignment.center,
+        child: Icon(Icons.inventory_2, color: Colors.grey),
+      );
+    }
+
+    return Image.asset(
+      imagePath,
+      width: 48,
+      height: 48,
+      fit: BoxFit.cover,
+      errorBuilder: (context, error, stackTrace) {
+        return Container(
+          width: 48,
+          height: 48,
+          color: Colors.grey.shade200,
+          alignment: Alignment.center,
+          child: Icon(Icons.inventory_2, color: Colors.grey),
+        );
+      },
+    );
+  }
+
+  Widget buildOrderPanel(
+    Map<String, dynamic> order,
+    Map<String, dynamic>? driver,
+  ) {
+    final status = order['status'] ?? 'Pending';
+    final items = (order['items'] as List?) ?? [];
+    final total = ((order['total'] ?? 0) as num).toDouble();
+    final driverName =
+        driver?['name'] ?? driver?['driverName'] ?? 'Assigned driver';
+    final hasDriver = order['driverId'] != null;
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.12),
+            blurRadius: 12,
+            offset: Offset(0, -3),
+          ),
+        ],
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: colorForStatus(status).withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    status,
+                    style: TextStyle(
+                      color: colorForStatus(status),
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                Spacer(),
+                Text(
+                  "\$${total.toStringAsFixed(2)}",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
+            SizedBox(height: 12),
+            Text(
+              trackingMessage(status, hasDriver),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            SizedBox(height: 8),
+            infoTile(
+              Icons.store,
+              "Store",
+              order['storeName'] ?? 'Supply store',
+            ),
+            infoTile(
+              Icons.person,
+              "Driver",
+              hasDriver ? driverName : 'Not assigned yet',
+            ),
+            infoTile(Icons.inventory_2, "Parts", "${items.length} items"),
+            SizedBox(height: 8),
+            Text(
+              "Order Items",
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 8),
+            ...items.take(4).map((item) {
+              final itemMap = item is Map ? item : <String, dynamic>{};
+              final name = (itemMap['name'] ?? 'Part').toString();
+              final quantity = itemMap['quantity'] ?? 1;
+              final imagePath = itemMap['image'] as String?;
+              final canOpenImage = imagePath != null && imagePath.isNotEmpty;
+
+              return Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: canOpenImage
+                      ? () {
+                          appNavigatorKey.currentState?.push(
+                            MaterialPageRoute(
+                              builder: (_) => FullScreenPartImageScreen(
+                                imagePath: imagePath,
+                                title: name,
+                              ),
+                            ),
+                          );
+                        }
+                      : null,
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Stack(
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: itemImage(imagePath),
+                            ),
+                            if (canOpenImage)
+                              Positioned(
+                                right: 3,
+                                bottom: 3,
+                                child: Container(
+                                  padding: EdgeInsets.all(2),
+                                  decoration: BoxDecoration(
+                                    color: Colors.black54,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(
+                                    Icons.zoom_in,
+                                    color: Colors.white,
+                                    size: 13,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            name,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Text("x$quantity"),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+            if (items.length > 4)
+              Text(
+                "+${items.length - 4} more items",
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget buildTracker(
+    Map<String, dynamic> order,
+    Map<String, dynamic>? driver,
+  ) {
+    final status = order['status'] ?? 'Pending';
+    final store = latLngFromOrder(order, 'storeLat', 'storeLng');
+    final customer = latLngFromOrder(order, 'customerLat', 'customerLng');
+    final driverPosition = driverLatLng(driver);
+
+    return Column(
+      children: [
+        Expanded(
+          flex: 5,
+          child: GoogleMap(
+            initialCameraPosition: CameraPosition(
+              target: mapCenter(driverPosition, store, customer),
+              zoom: 13,
+            ),
+            markers: buildMarkers(
+              driver: driverPosition,
+              store: store,
+              customer: customer,
+            ),
+            polylines: buildPolylines(
+              driver: driverPosition,
+              store: store,
+              customer: customer,
+              status: status,
+            ),
+            myLocationButtonEnabled: false,
+            zoomControlsEnabled: false,
+          ),
+        ),
+        Expanded(flex: 4, child: buildOrderPanel(order, driver)),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text("Track Order")),
+      body: StreamBuilder<DocumentSnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('orders')
+            .doc(orderId)
+            .snapshots(),
+        builder: (context, orderSnapshot) {
+          if (!orderSnapshot.hasData) {
+            return Center(child: CircularProgressIndicator());
+          }
+
+          if (!orderSnapshot.data!.exists) {
+            return Center(child: Text("Order not found"));
+          }
+
+          final order = orderSnapshot.data!.data() as Map<String, dynamic>;
+          final driverId = order['driverId'];
+
+          if (driverId is! String || driverId.isEmpty) {
+            return buildTracker(order, null);
+          }
+
+          return StreamBuilder<DocumentSnapshot>(
+            stream: FirebaseFirestore.instance
+                .collection('drivers')
+                .doc(driverId)
+                .snapshots(),
+            builder: (context, driverSnapshot) {
+              final driver =
+                  driverSnapshot.data?.data() as Map<String, dynamic>?;
+              return buildTracker(order, driver);
+            },
+          );
+        },
       ),
     );
   }
@@ -2153,7 +3988,7 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                 SizedBox(height: 30),
 
                 _roleCard("Customer", Icons.person, Colors.blue),
-                //_roleCard("Store", Icons.store, Colors.green),
+                _roleCard("Store", Icons.store, Colors.green),
                 _roleCard("Driver", Icons.local_shipping, Colors.orange),
 
                 SizedBox(height: 20),
@@ -2174,6 +4009,49 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                               final user = FirebaseAuth.instance.currentUser;
 
                               String? storeName;
+
+                              if (selectedRole == "store") {
+                                storeName = await showDialog<String>(
+                                  context: context,
+                                  barrierDismissible: false,
+                                  builder: (context) {
+                                    final controller = TextEditingController();
+
+                                    return AlertDialog(
+                                      title: Text("Store Name"),
+                                      content: TextField(
+                                        controller: controller,
+                                        textCapitalization:
+                                            TextCapitalization.words,
+                                        decoration: InputDecoration(
+                                          hintText: "Enter your store name",
+                                          border: OutlineInputBorder(),
+                                        ),
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(context),
+                                          child: Text("Cancel"),
+                                        ),
+                                        ElevatedButton(
+                                          onPressed: () {
+                                            final name = controller.text.trim();
+                                            if (name.isEmpty) return;
+                                            Navigator.pop(context, name);
+                                          },
+                                          child: Text("Save"),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                );
+
+                                if (storeName == null || storeName.isEmpty) {
+                                  setState(() => isLoading = false);
+                                  return;
+                                }
+                              }
 
                               // 🔥 SHOW DIALOG FIRST (instant)
                               /*if (selectedRole == "store") {
@@ -2286,6 +4164,10 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                                     "role": selectedRole,
                                     "storeName": storeName,
                                   }, SetOptions(merge: true));
+
+                              await PushNotificationService.saveCurrentToken(
+                                user.uid,
+                              );
 
                               setState(() => isLoading = false);
 
@@ -2462,7 +4344,7 @@ class _RoleRouterContent extends StatelessWidget {
         // 🔥 4. FINAL ROUTING
         if (role == "store") {
           final storeName = data['storeName'] ?? "My Store";
-          return StoreOrdersScreen(storeName: storeName);
+          return StoreDashboardScreen(storeName: storeName);
         } else if (role == "driver") {
           return FutureBuilder<DocumentSnapshot>(
             future: FirebaseFirestore.instance
@@ -2480,6 +4362,12 @@ class _RoleRouterContent extends StatelessWidget {
 
               if (driverDoc == null || !driverDoc.exists) {
                 // 🔥 NO DRIVER PROFILE → SHOW ONBOARDING
+                return DriverOnboardingScreen();
+              }
+
+              final driverData = driverDoc.data() as Map<String, dynamic>?;
+
+              if (driverData?['onboardingComplete'] != true) {
                 return DriverOnboardingScreen();
               }
 
@@ -2501,6 +4389,641 @@ class _RoleRouterContent extends StatelessWidget {
 
         print("🔥 ROLE SAVED");
       },
+    );
+  }
+}
+
+class StoreDashboardScreen extends StatefulWidget {
+  final String storeName;
+
+  const StoreDashboardScreen({required this.storeName});
+
+  @override
+  State<StoreDashboardScreen> createState() => _StoreDashboardScreenState();
+}
+
+class _StoreDashboardScreenState extends State<StoreDashboardScreen> {
+  Future<void> updateStoreName() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final controller = TextEditingController(text: widget.storeName);
+
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Update Store Name"),
+          content: TextField(
+            controller: controller,
+            textCapitalization: TextCapitalization.words,
+            decoration: InputDecoration(
+              hintText: "Store name",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final name = controller.text.trim();
+                if (name.isEmpty) return;
+                Navigator.pop(context, name);
+              },
+              child: Text("Save"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (user == null || newName == null || newName.isEmpty) return;
+
+    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+      "storeName": newName,
+    }, SetOptions(merge: true));
+  }
+
+  Widget dashboardTile({
+    required IconData icon,
+    required String title,
+    required String value,
+    required Color color,
+  }) {
+    return Container(
+      width: double.infinity,
+      margin: EdgeInsets.only(bottom: 12),
+      padding: EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, color: color),
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: Colors.grey.shade600,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: 3),
+                Text(
+                  value,
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
+    return Scaffold(
+      backgroundColor: Colors.grey.shade100,
+      appBar: AppBar(
+        title: Text(widget.storeName),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: "Inventory",
+            icon: Icon(Icons.assignment),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => StoreInventoryScreen()),
+              );
+            },
+          ),
+        ],
+      ),
+      body: StreamBuilder<DocumentSnapshot>(
+        stream: user == null
+            ? null
+            : FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .snapshots(),
+        builder: (context, snapshot) {
+          final data = snapshot.data?.data() as Map<String, dynamic>?;
+          final storeName = data?['storeName'] ?? widget.storeName;
+          final address = data?['address'] ?? 'No store address saved yet';
+
+          return ListView(
+            padding: EdgeInsets.all(16),
+            children: [
+              Container(
+                padding: EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  color: Colors.green.shade700,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.store, color: Colors.white, size: 34),
+                    SizedBox(height: 12),
+                    Text(
+                      storeName,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      "Store profile only. Orders are currently routed directly to drivers.",
+                      style: TextStyle(color: Colors.white70, height: 1.3),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(height: 16),
+              dashboardTile(
+                icon: Icons.badge,
+                title: "Role",
+                value: "Store account",
+                color: Colors.green,
+              ),
+              dashboardTile(
+                icon: Icons.location_on,
+                title: "Location",
+                value: address,
+                color: Colors.blue,
+              ),
+              dashboardTile(
+                icon: Icons.inventory_2,
+                title: "Order Flow",
+                value: "Store confirmation is off for launch",
+                color: Colors.orange,
+              ),
+              SizedBox(height: 8),
+              SizedBox(
+                height: 50,
+                child: ElevatedButton.icon(
+                  onPressed: updateStoreName,
+                  icon: Icon(Icons.edit),
+                  label: Text("Update Store Name"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green.shade700,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+              ),
+              SizedBox(height: 10),
+              SizedBox(
+                height: 50,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => AddressSearchScreen()),
+                    );
+                  },
+                  icon: Icon(Icons.location_on),
+                  label: Text("Update Store Location"),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.green.shade800,
+                    side: BorderSide(color: Colors.green.shade700),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class StoreInventoryScreen extends StatefulWidget {
+  @override
+  State<StoreInventoryScreen> createState() => _StoreInventoryScreenState();
+}
+
+class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
+  String selectedTrade = "All";
+  String selectedCategory = "All";
+  String searchText = "";
+  bool isSaving = false;
+
+  final List<String> trades = ["All", "Plumbing", "HVAC"];
+
+  String inventoryKey(Map<String, dynamic> item) {
+    final raw = "${item['trade']}|${item['name']}";
+    return base64Url.encode(utf8.encode(raw));
+  }
+
+  List<Map<String, dynamic>> inventoryParts() {
+    final plumbingParts = _PlumbingScreenState().parts.map((item) {
+      return {
+        "trade": "Plumbing",
+        "name": item["name"] ?? "Part",
+        "image": item["image"],
+        "categories": item["categories"] ?? [],
+      };
+    });
+
+    final hvacParts = _HVACScreenState().parts.map((item) {
+      return {
+        "trade": "HVAC",
+        "name": item["name"] ?? "Part",
+        "image": item["image"],
+        "categories": item["categories"] ?? [],
+      };
+    });
+
+    final seen = <String>{};
+    final combined = [...plumbingParts, ...hvacParts].where((item) {
+      final key = inventoryKey(item);
+      if (seen.contains(key)) return false;
+      seen.add(key);
+      return true;
+    }).toList();
+
+    combined.sort((a, b) {
+      final tradeCompare = a['trade'].toString().compareTo(
+        b['trade'].toString(),
+      );
+      if (tradeCompare != 0) return tradeCompare;
+      return a['name'].toString().compareTo(b['name'].toString());
+    });
+
+    return combined;
+  }
+
+  List<String> categoryTabs(List<Map<String, dynamic>> parts) {
+    final categories = <String>{"All"};
+
+    for (final item in parts) {
+      if (selectedTrade != "All" && item['trade'] != selectedTrade) {
+        continue;
+      }
+
+      final itemCategories = (item['categories'] as List?) ?? [];
+      for (final category in itemCategories) {
+        final label = category.toString().trim();
+        if (label.isNotEmpty) {
+          categories.add(label);
+        }
+      }
+    }
+
+    final sorted = categories.toList();
+    sorted.sort((a, b) {
+      if (a == "All") return -1;
+      if (b == "All") return 1;
+      return a.compareTo(b);
+    });
+
+    return sorted;
+  }
+
+  List<Map<String, dynamic>> filteredParts(List<Map<String, dynamic>> parts) {
+    final query = searchText.trim().toLowerCase();
+
+    return parts.where((item) {
+      final tradeMatches =
+          selectedTrade == "All" || item['trade'] == selectedTrade;
+      final itemCategories = (item['categories'] as List?) ?? [];
+      final categoryMatches =
+          selectedCategory == "All" ||
+          itemCategories.any(
+            (category) => category.toString().trim() == selectedCategory,
+          );
+      final name = item['name'].toString().toLowerCase();
+      final categories = itemCategories
+          .map((category) => category.toString().toLowerCase())
+          .join(' ');
+      final searchMatches =
+          query.isEmpty || name.contains(query) || categories.contains(query);
+
+      return tradeMatches && categoryMatches && searchMatches;
+    }).toList();
+  }
+
+  Widget partImage(String? imagePath) {
+    if (imagePath == null || imagePath.isEmpty) {
+      return Container(
+        width: 48,
+        height: 48,
+        color: Colors.grey.shade200,
+        alignment: Alignment.center,
+        child: Icon(Icons.inventory_2, color: Colors.grey),
+      );
+    }
+
+    return Image.asset(
+      imagePath,
+      width: 48,
+      height: 48,
+      fit: BoxFit.cover,
+      errorBuilder: (context, error, stackTrace) {
+        return Container(
+          width: 48,
+          height: 48,
+          color: Colors.grey.shade200,
+          alignment: Alignment.center,
+          child: Icon(Icons.inventory_2, color: Colors.grey),
+        );
+      },
+    );
+  }
+
+  Future<void> updateInventory({
+    required Map<String, dynamic> item,
+    required Map<String, dynamic> currentInventory,
+    required bool carries,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || isSaving) return;
+
+    setState(() => isSaving = true);
+
+    final updatedInventory = Map<String, dynamic>.from(currentInventory);
+    updatedInventory[inventoryKey(item)] = {
+      "carries": carries,
+      "name": item['name'],
+      "trade": item['trade'],
+      "image": item['image'],
+      "updatedAt": DateTime.now().toIso8601String(),
+    };
+
+    await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+      "storeInventory": updatedInventory,
+    }, SetOptions(merge: true));
+
+    if (mounted) {
+      setState(() => isSaving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    final allParts = inventoryParts();
+
+    return Scaffold(
+      backgroundColor: Colors.grey.shade100,
+      appBar: AppBar(title: Text("Inventory"), centerTitle: true),
+      body: user == null
+          ? Center(child: Text("Log in to manage inventory"))
+          : StreamBuilder<DocumentSnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                final data = snapshot.data?.data() as Map<String, dynamic>?;
+                final inventory = Map<String, dynamic>.from(
+                  (data?['storeInventory'] as Map?) ?? {},
+                );
+                final categoryOptions = categoryTabs(allParts);
+                if (!categoryOptions.contains(selectedCategory)) {
+                  selectedCategory = "All";
+                }
+                final shownParts = filteredParts(allParts);
+                final carriedCount = inventory.values.where((entry) {
+                  return entry is Map && entry['carries'] == true;
+                }).length;
+
+                return Column(
+                  children: [
+                    Container(
+                      color: Colors.white,
+                      padding: EdgeInsets.fromLTRB(14, 12, 14, 10),
+                      child: Column(
+                        children: [
+                          TextField(
+                            decoration: InputDecoration(
+                              hintText: "Search parts",
+                              prefixIcon: Icon(Icons.search),
+                              filled: true,
+                              fillColor: Colors.grey.shade100,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(10),
+                                borderSide: BorderSide.none,
+                              ),
+                            ),
+                            onChanged: (value) {
+                              setState(() {
+                                searchText = value;
+                              });
+                            },
+                          ),
+                          SizedBox(height: 10),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  child: Row(
+                                    children: trades.map((trade) {
+                                      final selected = selectedTrade == trade;
+                                      return Padding(
+                                        padding: EdgeInsets.only(right: 8),
+                                        child: ChoiceChip(
+                                          label: Text(trade),
+                                          selected: selected,
+                                          selectedColor: Colors.green.shade700,
+                                          labelStyle: TextStyle(
+                                            color: selected
+                                                ? Colors.white
+                                                : Colors.black87,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          onSelected: (_) {
+                                            setState(() {
+                                              selectedTrade = trade;
+                                              selectedCategory = "All";
+                                            });
+                                          },
+                                        ),
+                                      );
+                                    }).toList(),
+                                  ),
+                                ),
+                              ),
+                              Text(
+                                "$carriedCount carried",
+                                style: TextStyle(
+                                  color: Colors.grey.shade700,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                          SizedBox(height: 8),
+                          SizedBox(
+                            height: 44,
+                            child: ListView(
+                              scrollDirection: Axis.horizontal,
+                              children: categoryOptions.map((category) {
+                                final selected = selectedCategory == category;
+                                return Padding(
+                                  padding: EdgeInsets.only(right: 8),
+                                  child: ChoiceChip(
+                                    label: Text(
+                                      category,
+                                      style: TextStyle(
+                                        color: selected
+                                            ? Colors.white
+                                            : Colors.black87,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                    selected: selected,
+                                    selectedColor: Colors.orange,
+                                    backgroundColor: Colors.grey.shade200,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(20),
+                                    ),
+                                    onSelected: (_) {
+                                      setState(() {
+                                        selectedCategory = category;
+                                      });
+                                    },
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      child: ListView.separated(
+                        padding: EdgeInsets.all(12),
+                        itemCount: shownParts.length,
+                        separatorBuilder: (context, index) =>
+                            SizedBox(height: 8),
+                        itemBuilder: (context, index) {
+                          final item = shownParts[index];
+                          final key = inventoryKey(item);
+                          final saved = inventory[key];
+                          final carries =
+                              saved is Map && saved['carries'] == true;
+                          final markedNo =
+                              saved is Map && saved['carries'] == false;
+                          final categories =
+                              ((item['categories'] as List?) ?? [])
+                                  .take(2)
+                                  .join(' • ');
+
+                          return Container(
+                            padding: EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: carries
+                                    ? Colors.green.shade200
+                                    : markedNo
+                                    ? Colors.red.shade100
+                                    : Colors.grey.shade200,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: partImage(item['image'] as String?),
+                                ),
+                                SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        item['name'].toString(),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      SizedBox(height: 3),
+                                      Text(
+                                        "${item['trade']}${categories.isEmpty ? '' : ' • $categories'}",
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: Colors.grey.shade600,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                SizedBox(width: 8),
+                                IconButton(
+                                  tooltip: "Carry item",
+                                  icon: Icon(
+                                    carries
+                                        ? Icons.check_circle
+                                        : Icons.check_circle_outline,
+                                    color: carries ? Colors.green : Colors.grey,
+                                  ),
+                                  onPressed: () => updateInventory(
+                                    item: item,
+                                    currentInventory: inventory,
+                                    carries: true,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: "Do not carry",
+                                  icon: Icon(
+                                    markedNo
+                                        ? Icons.cancel
+                                        : Icons.cancel_outlined,
+                                    color: markedNo ? Colors.red : Colors.grey,
+                                  ),
+                                  onPressed: () => updateInventory(
+                                    item: item,
+                                    currentInventory: inventory,
+                                    carries: false,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
     );
   }
 }
@@ -3023,7 +5546,411 @@ Widget _orderCard(int index) {
   );
 }
 
+class DriverOrderDetailsScreen extends StatelessWidget {
+  final Map<String, dynamic> order;
+  final String orderId;
+
+  DriverOrderDetailsScreen({required this.order, required this.orderId});
+
+  Widget itemImage(String? imagePath) {
+    if (imagePath == null || imagePath.isEmpty) {
+      return Container(
+        width: 72,
+        height: 72,
+        color: Colors.grey.shade200,
+        alignment: Alignment.center,
+        child: Icon(Icons.inventory_2, color: Colors.grey),
+      );
+    }
+
+    return Image.asset(
+      imagePath,
+      width: 72,
+      height: 72,
+      fit: BoxFit.cover,
+      errorBuilder: (context, error, stackTrace) {
+        return Container(
+          width: 72,
+          height: 72,
+          color: Colors.grey.shade200,
+          alignment: Alignment.center,
+          child: Icon(Icons.inventory_2, color: Colors.grey),
+        );
+      },
+    );
+  }
+
+  Color statusColor(String status) {
+    switch (status) {
+      case "Picked Up":
+        return Colors.orange;
+      case "Delivered":
+        return Colors.green;
+      case "Accepted":
+        return Colors.blue;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  int totalQuantity(List items) {
+    int total = 0;
+
+    for (final item in items) {
+      if (item is Map<String, dynamic>) {
+        total += (item['quantity'] ?? 1) as int;
+      }
+    }
+
+    return total;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = (order['items'] as List?) ?? [];
+    final customerName = order['customerName'] ?? 'Customer';
+    final storeName = order['storeName'] ?? 'Store';
+    final status = order['status'] ?? 'Pending';
+    final total = ((order['total'] ?? 0) as num).toDouble();
+    final color = statusColor(status);
+
+    return Scaffold(
+      backgroundColor: Colors.grey.shade100,
+      appBar: AppBar(
+        title: Text("Order Parts"),
+        actions: [
+          Padding(
+            padding: EdgeInsets.only(right: 12),
+            child: Center(
+              child: Container(
+                padding: EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: color),
+                ),
+                child: Text(
+                  status,
+                  style: TextStyle(color: color, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 16),
+            color: Colors.white,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "$customerName's Order",
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 10),
+                Row(
+                  children: [
+                    Icon(Icons.store, size: 18, color: Colors.grey.shade700),
+                    SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        storeName,
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+                SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Container(
+                        padding: EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade100,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "PARTS",
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              "${totalQuantity(items)}",
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(width: 10),
+                    Expanded(
+                      child: Container(
+                        padding: EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade100,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "TOTAL",
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              "\$${total.toStringAsFixed(2)}",
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: items.isEmpty
+                ? Center(child: Text("No parts listed for this order"))
+                : ListView.builder(
+                    padding: EdgeInsets.all(12),
+                    itemCount: items.length,
+                    itemBuilder: (context, index) {
+                      final item = items[index] as Map<String, dynamic>;
+                      final quantity = item['quantity'] ?? 1;
+                      final price = ((item['price'] ?? 0) as num).toDouble();
+                      final lineTotal = price * (quantity as int);
+                      final imagePath = item['image'] as String?;
+                      final itemName = (item['name'] ?? 'Part').toString();
+                      final canOpenImage =
+                          imagePath != null && imagePath.isNotEmpty;
+
+                      return Card(
+                        margin: EdgeInsets.only(bottom: 10),
+                        elevation: 1,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(8),
+                          onTap: canOpenImage
+                              ? () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => FullScreenPartImageScreen(
+                                        imagePath: imagePath,
+                                        title: itemName,
+                                      ),
+                                    ),
+                                  );
+                                }
+                              : null,
+                          child: Padding(
+                            padding: EdgeInsets.all(10),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Stack(
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: itemImage(imagePath),
+                                    ),
+                                    if (canOpenImage)
+                                      Positioned(
+                                        right: 4,
+                                        bottom: 4,
+                                        child: Container(
+                                          padding: EdgeInsets.all(3),
+                                          decoration: BoxDecoration(
+                                            color: Colors.black54,
+                                            shape: BoxShape.circle,
+                                          ),
+                                          child: Icon(
+                                            Icons.zoom_in,
+                                            color: Colors.white,
+                                            size: 16,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        itemName,
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 15,
+                                        ),
+                                      ),
+                                      SizedBox(height: 8),
+                                      Wrap(
+                                        spacing: 8,
+                                        runSpacing: 6,
+                                        children: [
+                                          Container(
+                                            padding: EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 4,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.blue.withOpacity(
+                                                0.1,
+                                              ),
+                                              borderRadius:
+                                                  BorderRadius.circular(20),
+                                            ),
+                                            child: Text(
+                                              "Qty $quantity",
+                                              style: TextStyle(
+                                                color: Colors.blue.shade800,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                          ),
+                                          Text(
+                                            "\$${price.toStringAsFixed(2)} each",
+                                            style: TextStyle(
+                                              color: Colors.grey.shade700,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      SizedBox(height: 8),
+                                      Text(
+                                        canOpenImage
+                                            ? "Tap item to view image"
+                                            : "Image not available",
+                                        style: TextStyle(
+                                          color: canOpenImage
+                                              ? Colors.green.shade700
+                                              : Colors.grey,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                SizedBox(width: 8),
+                                Text(
+                                  "\$${lineTotal.toStringAsFixed(2)}",
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class FullScreenPartImageScreen extends StatelessWidget {
+  final String imagePath;
+  final String title;
+
+  FullScreenPartImageScreen({required this.imagePath, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            Center(
+              child: InteractiveViewer(
+                minScale: 1,
+                maxScale: 4,
+                child: Image.asset(
+                  imagePath,
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    return Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.broken_image, color: Colors.white, size: 64),
+                        SizedBox(height: 12),
+                        Text(
+                          "Image unavailable",
+                          style: TextStyle(color: Colors.white),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ),
+            Positioned(
+              top: 8,
+              left: 8,
+              right: 8,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close, color: Colors.white, size: 30),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 // 🚚 DRIVER SCREEN
+
 class DriverScreen extends StatefulWidget {
   @override
   State<DriverScreen> createState() => _DriverScreenState();
@@ -3111,18 +6038,26 @@ class _DriverScreenState extends State<DriverScreen> {
 
       final response = await http.get(Uri.parse(url));
       final data = jsonDecode(response.body);
+      final status = data['status'];
 
-      if (data['status'] != "OK") {
-        print("❌ ROUTE ERROR: ${data['status']}");
+      if (status != "OK") {
+        print("❌ ROUTE ERROR: $status ${data['error_message'] ?? ''}");
         return;
       }
-      final leg = data['routes'][0]['legs'][0];
+
+      final routes = data['routes'] as List?;
+      if (routes == null || routes.isEmpty) {
+        print("❌ ROUTE ERROR: Google returned no routes");
+        return;
+      }
+
+      final leg = routes[0]['legs'][0];
 
       final distance = leg['distance']['text']; // "5.2 mi"
       final duration = leg['duration']['text']; // "12 mins"
       print("📦 ROUTE DATA: ${data['routes'][0]['legs'][0]}");
 
-      final points = data['routes'][0]['overview_polyline']['points'];
+      final points = routes[0]['overview_polyline']['points'];
       final decoded = decodePolyline(points);
 
       if (!mounted) return;
@@ -3169,9 +6104,29 @@ class _DriverScreenState extends State<DriverScreen> {
 
       final data1 = jsonDecode(res1.body);
       final data2 = jsonDecode(res2.body);
+      final status1 = data1['status'];
+      final status2 = data2['status'];
 
-      final leg1 = data1['routes'][0]['legs'][0];
-      final leg2 = data2['routes'][0]['legs'][0];
+      if (status1 != "OK" || status2 != "OK") {
+        print(
+          "❌ PREVIEW ROUTE ERROR: toStore=$status1 ${data1['error_message'] ?? ''} | toCustomer=$status2 ${data2['error_message'] ?? ''}",
+        );
+        return;
+      }
+
+      final routes1 = data1['routes'] as List?;
+      final routes2 = data2['routes'] as List?;
+
+      if (routes1 == null ||
+          routes1.isEmpty ||
+          routes2 == null ||
+          routes2.isEmpty) {
+        print("❌ PREVIEW ROUTE ERROR: Google returned no routes");
+        return;
+      }
+
+      final leg1 = routes1[0]['legs'][0];
+      final leg2 = routes2[0]['legs'][0];
 
       final distance1 = leg1['distance']['value']; // meters
       final distance2 = leg2['distance']['value'];
@@ -3186,13 +6141,8 @@ class _DriverScreenState extends State<DriverScreen> {
 
       final durationMinutes = (totalDurationSeconds / 60).round();
 
-      if (data1['status'] != "OK" || data2['status'] != "OK") {
-        print("❌ PREVIEW ROUTE ERROR");
-        return;
-      }
-
-      final points1 = data1['routes'][0]['overview_polyline']['points'];
-      final points2 = data2['routes'][0]['overview_polyline']['points'];
+      final points1 = routes1[0]['overview_polyline']['points'];
+      final points2 = routes2[0]['overview_polyline']['points'];
 
       final decoded1 = decodePolyline(points1);
       final decoded2 = decodePolyline(points2);
@@ -3607,12 +6557,22 @@ class _DriverScreenState extends State<DriverScreen> {
                     final storeLat = (order['storeLat'] as num?)?.toDouble();
                     final storeLng = (order['storeLng'] as num?)?.toDouble();
 
-                    if (storeLat != null &&
-                        storeLng != null &&
-                        (currentStoreLat != storeLat ||
-                            currentStoreLng != storeLng)) {
+                    if (storeLat != null && storeLng != null) {
+                      final storeChanged =
+                          currentStoreLat != storeLat ||
+                          currentStoreLng != storeLng;
+
                       currentStoreLat = storeLat;
                       currentStoreLng = storeLng;
+
+                      if ((storeChanged || storeRoutePoints.isEmpty) &&
+                          !isFetchingRoute) {
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (mounted) {
+                            getRoute();
+                          }
+                        });
+                      }
                     }
 
                     final status = order['status'];
@@ -3629,227 +6589,293 @@ class _DriverScreenState extends State<DriverScreen> {
 
                     return Align(
                       alignment: Alignment.centerLeft,
-                      child: Container(
-                        width: double.infinity,
-                        padding: EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Color(0xFFE8F5E9),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              "Active Delivery at $storeName",
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
+                      child: GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => DriverOrderDetailsScreen(
+                                order: order,
+                                orderId: orderDoc.id,
                               ),
                             ),
-                            Text(
-                              "$customerName's Order: \$${((order['total'] ?? 0) as num).toDouble().toStringAsFixed(2)}",
-                              style: TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            Text("$totalQuantity items"),
-                            SizedBox(height: 10),
-                            if (distanceText != null && eta != null)
-                              Padding(
-                                padding: EdgeInsets.only(top: 6),
-                                child: Text(
-                                  "$distanceText • $eta",
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.green[800],
-                                    fontSize: 14,
-                                  ),
+                          );
+                        },
+                        child: Container(
+                          width: double.infinity,
+                          padding: EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Color(0xFFE8F5E9),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "Active Delivery at $storeName",
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
                                 ),
                               ),
-                            Row(
-                              children: [
-                                // ✅ GREEN BUTTON
-                                Expanded(
-                                  child: ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.green,
+                              Text(
+                                "$customerName's Order: \$${((order['total'] ?? 0) as num).toDouble().toStringAsFixed(2)}",
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              Text("$totalQuantity items"),
+                              SizedBox(height: 4),
+                              Row(
+                                children: [
+                                  Icon(
+                                    Icons.touch_app,
+                                    size: 16,
+                                    color: Colors.green[800],
+                                  ),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    "Tap to view parts",
+                                    style: TextStyle(
+                                      color: Colors.green[800],
+                                      fontWeight: FontWeight.w600,
                                     ),
-                                    onPressed: isUpdatingStatus
-                                        ? null
-                                        : () async {
-                                            setState(
-                                              () => isUpdatingStatus = true,
-                                            );
+                                  ),
+                                ],
+                              ),
+                              SizedBox(height: 10),
 
-                                            startLocationUpdates();
+                              if (distanceText != null && eta != null)
+                                Padding(
+                                  padding: EdgeInsets.only(top: 6),
+                                  child: Text(
+                                    "$distanceText • $eta",
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.green[800],
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ),
+                              Row(
+                                children: [
+                                  // ✅ GREEN BUTTON
+                                  Expanded(
+                                    child: ElevatedButton(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.green,
+                                      ),
+                                      onPressed: isUpdatingStatus
+                                          ? null
+                                          : () async {
+                                              setState(
+                                                () => isUpdatingStatus = true,
+                                              );
 
-                                            final freshDoc =
+                                              startLocationUpdates();
+
+                                              final freshDoc =
+                                                  await FirebaseFirestore
+                                                      .instance
+                                                      .collection('orders')
+                                                      .doc(orderDoc.id)
+                                                      .get();
+
+                                              final freshData =
+                                                  freshDoc.data()
+                                                      as Map<String, dynamic>;
+                                              final currentStatus =
+                                                  freshData['status'];
+
+                                              String newStatus;
+
+                                              if (currentStatus == "Accepted") {
+                                                final pickupStoreLat =
+                                                    (freshData['storeLat']
+                                                            as num?)
+                                                        ?.toDouble();
+                                                final pickupStoreLng =
+                                                    (freshData['storeLng']
+                                                            as num?)
+                                                        ?.toDouble();
+
+                                                if (pickupStoreLat == null ||
+                                                    pickupStoreLng == null) {
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        "Store location is unavailable for this order.",
+                                                      ),
+                                                    ),
+                                                  );
+                                                  setState(
+                                                    () => isUpdatingStatus =
+                                                        false,
+                                                  );
+                                                  return;
+                                                }
+
+                                                final markedPickedUp =
+                                                    await markOrderPickedUp(
+                                                      orderId: orderDoc.id,
+                                                      storeLat: pickupStoreLat,
+                                                      storeLng: pickupStoreLng,
+                                                    );
+
+                                                if (markedPickedUp) {
+                                                  setState(() {
+                                                    isPickedUp = true;
+                                                  });
+                                                  switchToCustomerRoute();
+                                                }
+
+                                                if (mounted) {
+                                                  setState(
+                                                    () => isUpdatingStatus =
+                                                        false,
+                                                  );
+                                                }
+                                                return;
+                                              } else if (currentStatus ==
+                                                  "Picked Up") {
+                                                newStatus = "Delivered";
+                                              } else {
+                                                setState(
+                                                  () =>
+                                                      isUpdatingStatus = false,
+                                                );
+                                                return;
+                                              }
+
+                                              if (newStatus == "Delivered") {
+                                                final driverId = FirebaseAuth
+                                                    .instance
+                                                    .currentUser!
+                                                    .uid;
+                                                final driverPay = 12.00;
+
                                                 await FirebaseFirestore.instance
                                                     .collection('orders')
                                                     .doc(orderDoc.id)
-                                                    .get();
+                                                    .update({
+                                                      "status": "Delivered",
+                                                      "driverPay": driverPay,
+                                                      "createdAt":
+                                                          FieldValue.serverTimestamp(),
+                                                    });
 
-                                            final freshData =
-                                                freshDoc.data()
-                                                    as Map<String, dynamic>;
-                                            final currentStatus =
-                                                freshData['status'];
+                                                await FirebaseFirestore.instance
+                                                    .collection('drivers')
+                                                    .doc(driverId)
+                                                    .update({
+                                                      "earnings":
+                                                          FieldValue.increment(
+                                                            driverPay,
+                                                          ),
+                                                      "isBusy": false,
+                                                    });
+                                              }
 
-                                            String newStatus;
+                                              if (newStatus == "Delivered") {
+                                                setState(() {
+                                                  isPickedUp = false;
+                                                  isOnActiveDelivery = false;
+                                                  isPreviewingOrder = false;
 
-                                            if (currentStatus == "Accepted") {
-                                              newStatus = "Picked Up";
-                                            } else if (currentStatus ==
-                                                "Picked Up") {
-                                              newStatus = "Delivered";
-                                            } else {
+                                                  storeRoutePoints = [];
+                                                  customerRoutePoints = [];
+
+                                                  currentStoreLat = null;
+                                                  currentStoreLng = null;
+                                                  previewStoreLat = null;
+                                                  previewStoreLng = null;
+
+                                                  customerRouteOpacity = 1.0;
+
+                                                  distanceText = null;
+                                                  eta = null;
+                                                });
+
+                                                locationTimer?.cancel();
+                                              }
+
                                               setState(
                                                 () => isUpdatingStatus = false,
                                               );
-                                              return;
-                                            }
+                                            },
+                                      child: Text(
+                                        status == "Accepted"
+                                            ? "Mark Picked Up"
+                                            : status == "Picked Up"
+                                            ? "Mark Delivered"
+                                            : "",
+                                      ),
+                                    ),
+                                  ),
 
-                                            if (newStatus == "Delivered") {
-                                              final driverId = FirebaseAuth
+                                  SizedBox(width: 10),
+
+                                  // ❌ RED BUTTON
+                                  Expanded(
+                                    child: ElevatedButton(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.red,
+                                      ),
+                                      onPressed: () async {
+                                        await FirebaseFirestore.instance
+                                            .collection('orders')
+                                            .doc(orderDoc.id)
+                                            .update({
+                                              "status": "Pending",
+                                              "driverId": null,
+                                            });
+
+                                        await FirebaseFirestore.instance
+                                            .collection('drivers')
+                                            .doc(
+                                              FirebaseAuth
                                                   .instance
                                                   .currentUser!
-                                                  .uid;
-                                              final driverPay = 12.00;
+                                                  .uid,
+                                            )
+                                            .set({
+                                              "isBusy": false,
+                                            }, SetOptions(merge: true));
 
-                                              await FirebaseFirestore.instance
-                                                  .collection('orders')
-                                                  .doc(orderDoc.id)
-                                                  .update({
-                                                    "status": "Delivered",
-                                                    "driverPay": driverPay,
-                                                    "createdAt":
-                                                        FieldValue.serverTimestamp(),
-                                                  });
+                                        // 🔥 RESET MAP + STATE
+                                        setState(() {
+                                          isOnActiveDelivery = false;
+                                          isPreviewingOrder = false;
 
-                                              await FirebaseFirestore.instance
-                                                  .collection('drivers')
-                                                  .doc(driverId)
-                                                  .update({
-                                                    "earnings":
-                                                        FieldValue.increment(
-                                                          driverPay,
-                                                        ),
-                                                    "isBusy": false,
-                                                  });
-                                            } else {
-                                              await FirebaseFirestore.instance
-                                                  .collection('orders')
-                                                  .doc(orderDoc.id)
-                                                  .update({
-                                                    "status": newStatus,
-                                                  });
-                                            }
+                                          // 🔥 CLEAR ROUTES
+                                          storeRoutePoints = [];
+                                          customerRoutePoints = [];
 
-                                            if (newStatus == "Picked Up") {
-                                              setState(() {
-                                                isPickedUp = true;
-                                              });
+                                          // 🔥 RESET FADE
+                                          customerRouteOpacity = 1.0;
 
-                                              switchToCustomerRoute(); // 👈 switches map to customer
-                                            }
+                                          // 🔥 CLEAR STORE TARGET
+                                          currentStoreLat = null;
+                                          currentStoreLng = null;
 
-                                            if (newStatus == "Delivered") {
-                                              setState(() {
-                                                isPickedUp = false;
-                                                isOnActiveDelivery = false;
-                                                isPreviewingOrder = false;
+                                          // 🔥 CLEAR DISTANCE TEXT
+                                          distanceText = null;
+                                          eta = null;
+                                        });
 
-                                                storeRoutePoints = [];
-                                                customerRoutePoints = [];
-
-                                                currentStoreLat = null;
-                                                currentStoreLng = null;
-                                                previewStoreLat = null;
-                                                previewStoreLng = null;
-
-                                                customerRouteOpacity = 1.0;
-
-                                                distanceText = null;
-                                                eta = null;
-                                              });
-
-                                              locationTimer?.cancel();
-                                            }
-
-                                            setState(
-                                              () => isUpdatingStatus = false,
-                                            );
-                                          },
-                                    child: Text(
-                                      status == "Accepted"
-                                          ? "Mark Picked Up"
-                                          : status == "Picked Up"
-                                          ? "Mark Delivered"
-                                          : "",
+                                        locationTimer?.cancel();
+                                      },
+                                      child: Text(
+                                        status == "Picked Up"
+                                            ? "Cancel Delivery"
+                                            : "Cancel Pickup",
+                                      ),
                                     ),
                                   ),
-                                ),
-
-                                SizedBox(width: 10),
-
-                                // ❌ RED BUTTON
-                                Expanded(
-                                  child: ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.red,
-                                    ),
-                                    onPressed: () async {
-                                      await FirebaseFirestore.instance
-                                          .collection('orders')
-                                          .doc(orderDoc.id)
-                                          .update({
-                                            "status": "Pending",
-                                            "driverId": null,
-                                          });
-
-                                      await FirebaseFirestore.instance
-                                          .collection('drivers')
-                                          .doc(
-                                            FirebaseAuth
-                                                .instance
-                                                .currentUser!
-                                                .uid,
-                                          )
-                                          .set({
-                                            "isBusy": false,
-                                          }, SetOptions(merge: true));
-
-                                      // 🔥 RESET MAP + STATE
-                                      setState(() {
-                                        isOnActiveDelivery = false;
-                                        isPreviewingOrder = false;
-
-                                        // 🔥 CLEAR ROUTES
-                                        storeRoutePoints = [];
-                                        customerRoutePoints = [];
-
-                                        // 🔥 RESET FADE
-                                        customerRouteOpacity = 1.0;
-
-                                        // 🔥 CLEAR STORE TARGET
-                                        currentStoreLat = null;
-                                        currentStoreLng = null;
-
-                                        // 🔥 CLEAR DISTANCE TEXT
-                                        distanceText = null;
-                                        eta = null;
-                                      });
-
-                                      locationTimer?.cancel();
-                                    },
-                                    child: Text(
-                                      status == "Picked Up"
-                                          ? "Cancel Delivery"
-                                          : "Cancel Pickup",
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     );
@@ -3903,8 +6929,9 @@ class _DriverScreenState extends State<DriverScreen> {
                       );
                     }
 
-                    return Container(
-                      height: 220,
+                    return AnimatedContainer(
+                      duration: Duration(milliseconds: 250),
+                      height: previewOrderId != null ? 235 : 220,
                       child: ListView.builder(
                         controller: _scrollController,
                         scrollDirection: Axis.horizontal,
@@ -4029,6 +7056,20 @@ class _DriverScreenState extends State<DriverScreen> {
     String orderId,
     int index,
   ) {
+    final isSelected = previewOrderId == orderId;
+    final items = (order['items'] as List?) ?? [];
+    final total = ((order['total'] ?? 0) as num).toDouble();
+    final tradeType = order['tradeType'] ?? 'Trade';
+    final customerName = order['customerName'] ?? 'Customer';
+    final storeName = order['storeName'] ?? 'Store';
+
+    int totalQuantity = 0;
+    for (final item in items) {
+      if (item is Map<String, dynamic>) {
+        totalQuantity += (item['quantity'] ?? 1) as int;
+      }
+    }
+
     return GestureDetector(
       onTap: () {
         setState(() {
@@ -4052,188 +7093,221 @@ class _DriverScreenState extends State<DriverScreen> {
 
         Future.delayed(Duration(milliseconds: 50), () {
           _scrollController.animateTo(
-            index * 260.0,
+            index * 280.0,
             duration: Duration(milliseconds: 300),
             curve: Curves.easeInOut,
           );
         });
 
-        previewRoute(); // 👈 triggers route preview
+        previewRoute();
       },
-
       child: AnimatedContainer(
-        duration: Duration(milliseconds: 300),
-
-        width: previewOrderId == orderId
-            ? MediaQuery.of(context).size.width * 0.9
-            : 250,
-
-        height: previewOrderId == orderId ? 250 : 120, // ✅ LOCKED
-
-        margin: EdgeInsets.all(10),
+        duration: Duration(milliseconds: 250),
+        width: isSelected ? MediaQuery.of(context).size.width * 0.9 : 265,
+        height: isSelected ? 215 : 200,
+        margin: EdgeInsets.fromLTRB(10, 10, 6, 10),
         padding: EdgeInsets.all(12),
-
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isSelected ? Colors.blue : Colors.grey.shade200,
+            width: isSelected ? 2 : 1,
+          ),
           boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 6),
+            BoxShadow(
+              color: Colors.black.withOpacity(0.08),
+              blurRadius: 8,
+              offset: Offset(0, 3),
+            ),
           ],
         ),
-
         child: Stack(
           children: [
-            // 🔹 CONTENT (top area)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
+            Positioned.fill(
               bottom: 50,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    order['customerName'] ?? 'Customer',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                  ),
-                  Text(
-                    "Order at ${order['storeName'] ?? 'Store'}",
-                    style: TextStyle(color: Colors.grey[700]),
-                  ),
-                  Text(
-                    "Trade: ${order['tradeType'] ?? 'Unknown'}",
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Colors.blue,
-                    ),
-                  ),
-
-                  SizedBox(height: 6),
-
-                  Text("${(order['items'] as List).length} items"),
-
-                  AnimatedPadding(
-                    duration: Duration(milliseconds: 250),
-                    curve: Curves.easeInOut,
-                    padding: EdgeInsets.only(
-                      top: previewOrderId == orderId ? 10 : 2,
-                    ),
-                    child: SizedBox(
-                      height: 22,
-                      child: AnimatedOpacity(
-                        duration: Duration(milliseconds: 200),
-                        opacity:
-                            (previewOrderId == orderId &&
-                                previewDistance != null &&
-                                previewDuration != null)
-                            ? 1.0
-                            : 0.0,
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
                         child: Text(
-                          "$previewDistance • $previewDuration",
+                          storeName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.green[700],
+                            fontSize: 16,
                           ),
                         ),
                       ),
-                    ),
+                      SizedBox(width: 8),
+                      ConstrainedBox(
+                        constraints: BoxConstraints(maxWidth: 90),
+                        child: Container(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            tradeType,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Colors.blue.shade800,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (isSelected) ...[
+                        SizedBox(width: 4),
+                        SizedBox(
+                          width: 34,
+                          height: 34,
+                          child: IconButton(
+                            padding: EdgeInsets.zero,
+                            tooltip: "Close preview",
+                            icon: Icon(Icons.close, size: 20),
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.grey.shade100,
+                              foregroundColor: Colors.grey.shade700,
+                            ),
+                            onPressed: () {
+                              setState(() {
+                                previewOrderId = null;
+                                previewStoreLat = null;
+                                previewStoreLng = null;
+                                previewCustomerLat = null;
+                                previewCustomerLng = null;
+
+                                isPreviewingOrder = false;
+                                isOnActiveDelivery = false;
+
+                                storeRoutePoints = [];
+                                customerRoutePoints = [];
+                                customerRouteOpacity = 1.0;
+                                previewDistance = null;
+                                previewDuration = null;
+                              });
+                            },
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
+                  SizedBox(height: 4),
+                  Text(
+                    customerName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: Colors.grey.shade700),
+                  ),
+                  SizedBox(height: 10),
+                  Row(
+                    children: [
+                      _smallDriverStat(
+                        Icons.inventory_2,
+                        "$totalQuantity items",
+                      ),
+                      SizedBox(width: 8),
+                      _smallDriverStat(
+                        Icons.attach_money,
+                        total.toStringAsFixed(2),
+                      ),
+                    ],
+                  ),
+                  if (isSelected &&
+                      previewDistance != null &&
+                      previewDuration != null)
+                    Padding(
+                      padding: EdgeInsets.only(top: 12),
+                      child: Row(
+                        children: [
+                          Icon(Icons.route, size: 16, color: Colors.green[700]),
+                          SizedBox(width: 5),
+                          Text(
+                            "$previewDistance • $previewDuration",
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                              color: Colors.green[700],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                 ],
               ),
             ),
-
-            // 🔹 BACK ARROW (TOP RIGHT) ✅ FIXED
-            if (previewOrderId == orderId)
-              Positioned(
-                top: 0,
-                right: 5,
-                child: IconButton(
-                  icon: Icon(Icons.arrow_back),
-                  onPressed: () {
-                    setState(() {
-                      previewOrderId = null;
-                      previewStoreLat = null;
-                      previewStoreLng = null;
-                      previewCustomerLat = null;
-                      previewCustomerLng = null;
-
-                      isPreviewingOrder = false;
-                      isOnActiveDelivery = false;
-
-                      // 🔥 CLEAR ROUTES
-                      storeRoutePoints = [];
-
-                      // 🔥 RESET FADE
-                      customerRouteOpacity = 1.0;
-                    });
-                  },
-                ),
-              ),
-
-            // 🔹 BUTTON (BOTTOM)
             Positioned(
               bottom: 0,
               left: 0,
               right: 0,
-              child: Padding(
-                padding: EdgeInsets.only(
-                  right: 50,
-                ), // 👈 keeps space without resizing
-                child: SizedBox(
-                  width: 250,
-                  height: 45,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: isPreviewingOrder
-                          ? Colors.blue
-                          : Colors.grey,
+              child: SizedBox(
+                height: 44,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: isSelected ? Colors.blue : Colors.grey,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
                     ),
-                    onPressed: isPreviewingOrder
-                        ? () async {
-                            final user = FirebaseAuth.instance.currentUser;
-
-                            final orderRef = FirebaseFirestore.instance
-                                .collection('orders')
-                                .doc(orderId);
-
-                            final freshOrder = await orderRef.get();
-
-                            final freshData = freshOrder.data();
-
-                            if (freshData == null ||
-                                freshData["status"] != "Pending") {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text("Order was already accepted"),
-                                ),
-                              );
-                              return;
-                            }
-
-                            await orderRef.update({
-                              "status": "Accepted",
-                              "driverId": user!.uid,
-                            });
-
-                            await FirebaseFirestore.instance
-                                .collection('drivers')
-                                .doc(user.uid)
-                                .set({"isBusy": true}, SetOptions(merge: true));
-
-                            setState(() {
-                              isOnActiveDelivery = true;
-                            });
-
-                            // 🔥 SWITCH TO STORE ROUTE
-                            await getRoute();
-
-                            // 🔥 ZOOM IN
-                            zoomToStoreRoute();
-                          }
-                        : null,
-                    child: Text("Accept Delivery"),
                   ),
+                  onPressed: isSelected
+                      ? () async {
+                          final user = FirebaseAuth.instance.currentUser;
+
+                          final orderRef = FirebaseFirestore.instance
+                              .collection('orders')
+                              .doc(orderId);
+
+                          final freshOrder = await orderRef.get();
+
+                          final freshData = freshOrder.data();
+
+                          if (freshData == null ||
+                              freshData["status"] != "Pending") {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text("Order was already accepted"),
+                              ),
+                            );
+                            return;
+                          }
+
+                          await orderRef.update({
+                            "status": "Accepted",
+                            "driverId": user!.uid,
+                          });
+
+                          await FirebaseFirestore.instance
+                              .collection('drivers')
+                              .doc(user.uid)
+                              .set({"isBusy": true}, SetOptions(merge: true));
+
+                          setState(() {
+                            currentStoreLat = previewStoreLat;
+                            currentStoreLng = previewStoreLng;
+                            isOnActiveDelivery = true;
+                            isPreviewingOrder = false;
+                          });
+
+                          startLocationUpdates();
+
+                          await getRoute();
+                          zoomToStoreRoute();
+                        }
+                      : null,
+                  icon: Icon(Icons.local_shipping, size: 18),
+                  label: Text(isSelected ? "Accept Delivery" : "Preview Route"),
                 ),
               ),
             ),
@@ -4241,6 +7315,123 @@ class _DriverScreenState extends State<DriverScreen> {
         ),
       ),
     );
+  }
+
+  Widget _smallDriverStat(IconData icon, String label) {
+    return Expanded(
+      child: Container(
+        padding: EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 15, color: Colors.grey.shade700),
+            SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<bool> markOrderPickedUp({
+    required String orderId,
+    required double storeLat,
+    required double storeLng,
+  }) async {
+    const pickupRadiusMeters = 300.0;
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) return false;
+
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw StateError("Turn on location services before marking pickup.");
+      }
+
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        throw StateError(
+          "Location permission is required before marking pickup.",
+        );
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: Duration(seconds: 15),
+      );
+
+      final distanceMeters = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        storeLat,
+        storeLng,
+      );
+
+      if (distanceMeters > pickupRadiusMeters) {
+        final distanceText = distanceMeters >= 1000
+            ? "${(distanceMeters / 1000).toStringAsFixed(1)} km"
+            : "${distanceMeters.round()} m";
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                "You are $distanceText from the store. Move within 300 m to mark this order picked up.",
+              ),
+            ),
+          );
+        }
+        return false;
+      }
+
+      setState(() {
+        currentPosition = LatLng(position.latitude, position.longitude);
+      });
+
+      await FirebaseFirestore.instance.collection('drivers').doc(user.uid).set({
+        "lat": position.latitude,
+        "lng": position.longitude,
+        "lastUpdated": FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'markOrderPickedUp',
+      );
+      await callable.call({"orderId": orderId});
+
+      return true;
+    } on FirebaseFunctionsException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(error.message ?? "Could not verify pickup location."),
+          ),
+        );
+      }
+      return false;
+    } catch (error) {
+      if (mounted) {
+        final message = error is StateError
+            ? error.message.toString()
+            : "Could not verify your location. Please try again.";
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
+      }
+      return false;
+    }
   }
 
   void startLocationUpdates() {
@@ -4261,7 +7452,11 @@ class _DriverScreenState extends State<DriverScreen> {
         await FirebaseFirestore.instance
             .collection('drivers')
             .doc(user.uid)
-            .update({"lat": position.latitude, "lng": position.longitude});
+            .set({
+              "lat": position.latitude,
+              "lng": position.longitude,
+              "lastUpdated": FieldValue.serverTimestamp(),
+            }, SetOptions(merge: true));
       }
 
       // 🔥 OPTIONAL: refresh route
@@ -4998,6 +8193,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Soldering wire for copper pipe (Brand may vary)",
       "image": "assets/images/LeadFreeSolder.jpg",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "8 oz. Flux",
@@ -5006,6 +8202,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Flux paste used before soldering to clean metal surface (Brand may vary)",
       "image": "assets/images/Flux.jpg",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "Flux Brush",
@@ -5013,6 +8210,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Brush used to apply flux paste to pipe (Brand may vary)",
       "image": "assets/images/FluxBrush.jpg",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "Plumbers Sanding Cloth 1-1/2 in. x 2 yd.",
@@ -5021,6 +8219,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Sanding cloth for prepping pipe for solder (Brand may vary)",
       "image": "assets/images/PlumbersCloth2yd.jpg",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "14.1 oz. Propane cyliner",
@@ -5029,6 +8228,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Propane cylinder for soldering copper pipe (Brand may vary)",
       "image": "assets/images/BluePropaneTank.png",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "Adjustable Propane Gas Torch",
@@ -5037,6 +8237,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Adjustable propane cylinder torch for soldering copper pipe (Brand may vary)",
       "image": "assets/images/PropaneTorch.png",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "soldering",
     },
     {
       "name": "Pipe Cutter",
@@ -5044,6 +8245,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Adjustable tool for cutting pipe (Brand may vary)",
       "image": "assets/images/AdjustablePipeCutter.png",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "Baby Pipe Cutter",
@@ -5051,6 +8253,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Small adjustable tool for cutting pipe (Brand may vary)",
       "image": "assets/images/BabyAdjustablePipeCutter.png",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "Pipe Prepping Tool",
@@ -5059,6 +8262,207 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Pipe prepping tool for pipes 1/2 in. to 3/4 in. (Brand may vary)",
       "image": "assets/images/PipePreppingTool.jpg",
       "categories": ["Soldering"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "2 in. Copper Pressure Coupling With Stop",
+      "price": 5.00,
+      "description":
+          "Copper coupling for connecting 2 in. pipe with internal stops (Brand may vary)",
+      "image": "assets/images/CopperNonSlipCoupling.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper Slip Coupling",
+      "price": 7.50,
+      "description":
+          "Copper coupling for connecting 2 in. pipe without internal stops (Brand may vary)",
+      "image": "assets/images/CopperSlipCoupling.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper ProPress Coupling With Stop",
+      "price": 12.00,
+      "description":
+          "Copper coupling for propress connecting 2 in. pipe with internal stops (Brand may vary)",
+      "image": "assets/images/CopperProPressNonSlipCoupling.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
+    },
+    {
+      "name": "2 in. Copper ProPress Coupling Without Stop",
+      "price": 16.50,
+      "description":
+          "Copper coupling for propress connecting 2 in. pipe without internal stops (Brand may vary)",
+      "image": "assets/images/CopperProPressSlipCoupling.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
+    },
+    {
+      "name": "2 in. Copper Tee Fitting",
+      "price": 24.00,
+      "description":
+          "Copper all cup tee fitting for connecting 2 in. pipe (Brand may vary)",
+      "image": "assets/images/CopperTee.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper ProPress Tee Fitting",
+      "price": 21.50,
+      "description":
+          "Copper tee fitting for connecting 2 in. pipe with propress (Brand may vary)",
+      "image": "assets/images/CopperProPressTee.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
+    },
+    {
+      "name": "2 in. Copper 45-Degree Fitting",
+      "price": 15.00,
+      "description":
+          "Copper 45-degree fitting for connecting 2 in. pipe (Brand may vary)",
+      "image": "assets/images/Copper45.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper 45-Degree Street Fitting",
+      "price": 20.00,
+      "description":
+          "Copper 45-degree fitting with one male end for connecting 2 in. pipe (Brand may vary)",
+      "image": "assets/images/CopperStreet45.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper 45-Degree ProPress Fitting",
+      "price": 20.00,
+      "description":
+          "Copper 45-degree fitting for connecting 2 in. pipe with propress (Brand may vary)",
+      "image": "assets/images/CopperProPress45.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
+    },
+    {
+      "name": "2 in. Copper 90-Degree Elbow",
+      "price": 9.00,
+      "description":
+          "Copper 90-degree Non-slip fitting for connecting 2 in. pipe (Brand may vary)",
+      "image": "assets/images/Copper90.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper 90-Degree Street Elbow",
+      "price": 15.50,
+      "description":
+          "Copper 90-degree street fitting for connecting 2 in. pipe (Brand may vary)",
+      "image": "assets/images/CopperStreet90.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper 90-Degree ProPress Elbow",
+      "price": 14.00,
+      "description":
+          "Copper 90-degree fitting for connecting 2 in. pipe with propress(Brand may vary)",
+      "image": "assets/images/CopperProPress90.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
+    },
+    /*{
+      "name": "1 in. Copper 90-Degree ProPress Street Elbow",
+      "price": 20.00,
+      "description":
+          "Copper 90-degree street fitting for connecting 1 in. pipe with propress(Brand may vary)",
+      "image": "assets/images/CopperCoupling.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+    },*/
+    {
+      "name": "2 in. Copper Female to Male Pipe Thread Adapter",
+      "price": 14.00,
+      "description":
+          "2 in. Copper female to Male Pipe Thread adapter (Brand may vary)",
+      "image": "assets/images/CopperFemaleToMPT.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper Female Threaded Adapter",
+      "price": 3.00,
+      "description": "2 in. Copper female threaded adapter (Brand may vary)",
+      "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
+      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Brass Cap",
+      "price": 15.00,
+      "description": "2 in. brass threaded cap (Brand may vary)",
+      "image": "assets/images/BrassCap.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass Coupling",
+      "price": 17.00,
+      "description": "2 in. brass threaded coupling (Brand may vary)",
+      "image": "assets/images/BrassCoupling.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass 90",
+      "price": 42.00,
+      "description": "2 in. brass threaded elbow fitting (Brand may vary)",
+      "image": "assets/images/Brass90.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass 45",
+      "price": 24.00,
+      "description": "1 in. brass threaded 45 fitting (Brand may vary)",
+      "image": "assets/images/Brass45.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass Street 90",
+      "price": 57.50,
+      "description":
+          "2 in. brass threaded street elbow fitting (Brand may vary)",
+      "image": "assets/images/BrassStreet90.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass Street 45",
+      "price": 31.50,
+      "description": "2 in. brass threaded street 45 fitting (Brand may vary)",
+      "image": "assets/images/BrassStreet45.jpg",
+      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
+    },
+    {
+      "name": "2 in. Brass Ball Valve(Threaded)",
+      "price": 35.00,
+      "description":
+          "2 Full port brass ball valve with threading on both ends (Brand may vary)",
+      "image": "assets/images/ThreadedBallValve.jpg",
+      "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
+    },
+    {
+      "name": "2 in. Brass Ball Valve(Non-Threaded)",
+      "price": 25.00,
+      "description":
+          "1 Full port brass ball valve with female port on both ends (Brand may very)",
+      "image": "assets/images/NonThreadedBallValve.jpg",
+      "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Copper Pressure Coupling With Stop",
@@ -5067,6 +8471,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 1 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper Slip Coupling",
@@ -5075,6 +8480,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 1 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper ProPress Coupling With Stop",
@@ -5083,6 +8489,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 1 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. Copper ProPress Coupling Without Stop",
@@ -5091,6 +8498,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 1 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. Copper Tee Fitting",
@@ -5099,6 +8507,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper all cup tee fitting for connecting 1 in. pipe (Brand may vary)",
       "image": "assets/images/CopperTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper ProPress Tee Fitting",
@@ -5107,6 +8516,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper tee fitting for connecting 1 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPressTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. Copper 45-Degree Fitting",
@@ -5115,6 +8525,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 1 in. pipe (Brand may vary)",
       "image": "assets/images/Copper45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper 45-Degree Street Fitting",
@@ -5123,6 +8534,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting with one male end for connecting 1 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper 45-Degree ProPress Fitting",
@@ -5131,6 +8543,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 1 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. Copper 90-Degree Elbow",
@@ -5139,6 +8552,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree Non-slip fitting for connecting 1 in. pipe (Brand may vary)",
       "image": "assets/images/Copper90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper 90-Degree Street Elbow",
@@ -5147,6 +8561,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree street fitting for connecting 1 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper 90-Degree ProPress Elbow",
@@ -5155,6 +8570,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree fitting for connecting 1 in. pipe with propress(Brand may vary)",
       "image": "assets/images/CopperProPress90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     /*{
       "name": "1 in. Copper 90-Degree ProPress Street Elbow",
@@ -5171,6 +8587,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. Copper female to Male Pipe Thread adapter (Brand may vary)",
       "image": "assets/images/CopperFemaleToMPT.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Copper Female Threaded Adapter",
@@ -5178,6 +8595,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. Brass Cap",
@@ -5185,6 +8603,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. brass threaded cap (Brand may vary)",
       "image": "assets/images/BrassCap.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass Coupling",
@@ -5192,6 +8611,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. brass threaded coupling (Brand may vary)",
       "image": "assets/images/BrassCoupling.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass 90",
@@ -5199,6 +8619,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. brass threaded elbow fitting (Brand may vary)",
       "image": "assets/images/Brass90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass 45",
@@ -5206,6 +8627,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. brass threaded 45 fitting (Brand may vary)",
       "image": "assets/images/Brass45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass Street 90",
@@ -5214,6 +8636,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. brass threaded street elbow fitting (Brand may vary)",
       "image": "assets/images/BrassStreet90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass Street 45",
@@ -5221,6 +8644,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. brass threaded street 45 fitting (Brand may vary)",
       "image": "assets/images/BrassStreet45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1 in. Brass Ball Valve(Threaded)",
@@ -5229,6 +8653,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 Full port brass ball valve with threading on both ends (Brand may vary)",
       "image": "assets/images/ThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Brass Ball Valve(Non-Threaded)",
@@ -5237,6 +8662,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 Full port brass ball valve with female port on both ends (Brand may very)",
       "image": "assets/images/NonThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Copper Pressure Coupling With Stop",
@@ -5245,6 +8671,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 3/4 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper Slip Coupling",
@@ -5253,6 +8680,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 3/4 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper ProPress Coupling With Stop",
@@ -5261,6 +8689,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 3/4 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. Copper ProPress Coupling Without Stop",
@@ -5269,6 +8698,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 3/4 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. Copper Tee Fitting",
@@ -5277,6 +8707,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper all cup tee fitting for connecting 3/4 in. pipe (Brand may vary)",
       "image": "assets/images/CopperTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper ProPress Tee Fitting",
@@ -5285,6 +8716,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper tee fitting for connecting 3/4 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPressTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. Copper 45-Degree Fitting",
@@ -5293,6 +8725,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 3/4 in. pipe (Brand may vary)",
       "image": "assets/images/Copper45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper 45-Degree Street Fitting",
@@ -5301,6 +8734,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting with one male end for connecting 3/4 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper 45-Degree ProPress Fitting",
@@ -5309,6 +8743,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 3/4 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. Copper 90-Degree Elbow",
@@ -5317,6 +8752,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree Non-slip fitting for connecting 3/4 in. pipe (Brand may vary)",
       "image": "assets/images/Copper90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper 90-Degree Street Elbow",
@@ -5325,6 +8761,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree street fitting for connecting 3/4 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper 90-Degree ProPress Elbow",
@@ -5333,6 +8770,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree fitting for connecting 3/4 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     /*{
       "name": "3/4 in. Copper 90-Degree ProPress Street Elbow",
@@ -5349,6 +8787,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. Copper female to Male Pipe Thread adapter (Brand may vary)",
       "image": "assets/images/CopperFemaleToMPT.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Copper Female Threaded Adapter",
@@ -5356,6 +8795,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. Brass Cap",
@@ -5363,6 +8803,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. brass threaded cap (Brand may vary)",
       "image": "assets/images/BrassCap.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass Coupling",
@@ -5370,6 +8811,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. brass threaded coupling(Brand may vary)",
       "image": "assets/images/BrassCoupling.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass 90",
@@ -5377,6 +8819,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. brass threaded elbow fitting (Brand may vary)",
       "image": "assets/images/Brass90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass 45",
@@ -5384,6 +8827,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. brass threaded 45 fitting (Brand may vary)",
       "image": "assets/images/Brass45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass Street 90",
@@ -5392,6 +8836,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. brass threaded street elbow fitting (Brand may vary)",
       "image": "assets/images/BrassStreet90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass Street 45",
@@ -5400,6 +8845,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. brass threaded street 45 fitting (Brand may vary)",
       "image": "assets/images/BrassStreet45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "3/4 in. Brass Ball Valve(Threaded)",
@@ -5408,6 +8854,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 Full port brass ball valve with threading on both ends (Brand may vary)",
       "image": "assets/images/ThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Brass Ball Valve(Non-Threaded)",
@@ -5416,6 +8863,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 Full port brass ball valve with female port on both ends (Brand may very)",
       "image": "assets/images/NonThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Copper Pressure Coupling With Stop",
@@ -5424,6 +8872,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 1/2 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper Slip Coupling",
@@ -5432,6 +8881,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for connecting 1/2 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper ProPress Coupling With Stop",
@@ -5440,6 +8890,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 1/2 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressNonSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1/2 in. Copper ProPress Coupling Without Stop",
@@ -5448,6 +8899,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper coupling for propress connecting 1/2 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressSlipCoupling.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1/2 in. Copper Tee Fitting",
@@ -5456,6 +8908,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper all cup tee fitting for connecting 1/2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper ProPress Tee Fitting",
@@ -5464,6 +8917,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper tee fitting for connecting 1/2 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPressTee.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1/2 in. Copper 45-Degree Fitting",
@@ -5472,6 +8926,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 1/2 in. pipe (Brand may vary)",
       "image": "assets/images/Copper45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper 45-Degree Street Fitting",
@@ -5480,6 +8935,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting with one male end for connecting 1/2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper 45-Degree ProPress Fitting",
@@ -5488,6 +8944,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 45-degree fitting for connecting 1/2 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress45.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1/2 in. Copper 90-Degree Elbow",
@@ -5496,6 +8953,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree Non-slip fitting for connecting 1/2 in. pipe (Brand may vary)",
       "image": "assets/images/Copper90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper 90-Degree Street Elbow",
@@ -5504,6 +8962,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree street fitting for connecting 1/2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper 90-Degree ProPress Elbow",
@@ -5512,6 +8971,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper 90-degree fitting for connecting 1/2 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress90.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "propress",
     },
     /*{
       "name": "1/2 in. Copper 90-Degree ProPress Street Elbow",
@@ -5528,6 +8988,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. Copper female to Male Pipe Thread adapter (Brand may vary)",
       "image": "assets/images/CopperFemaleToMPT.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Copper Female Threaded Adapter",
@@ -5535,6 +8996,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. Brass Cap",
@@ -5542,6 +9004,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. brass threaded cap (Brand may vary)",
       "image": "assets/images/BrassCap.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass Coupling",
@@ -5549,6 +9012,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. brass threaded coupling (Brand may vary)",
       "image": "assets/images/BrassCoupling.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass 90",
@@ -5556,6 +9020,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. brass threaded elbow fitting (Brand may vary)",
       "image": "assets/images/Brass90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass 45",
@@ -5563,6 +9028,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. brass threaded 45 fitting (Brand may vary)",
       "image": "assets/images/Brass45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass Street 90",
@@ -5571,6 +9037,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. brass threaded street elbow fitting (Brand may vary)",
       "image": "assets/images/BrassStreet90.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass Street 45",
@@ -5579,6 +9046,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. brass threaded street 45 fitting (Brand may vary)",
       "image": "assets/images/BrassStreet45.jpg",
       "categories": ["Brass", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "brassFittings",
     },
     {
       "name": "1/2 in. Brass Ball Valve(Threaded)",
@@ -5587,6 +9055,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 Full port brass ball valve with threading on both ends (Brand may vary)",
       "image": "assets/images/ThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Brass Ball Valve(Non-Threaded)",
@@ -5595,6 +9064,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. Full port brass ball valve with female port on both ends (Brand may very)",
       "image": "assets/images/NonThreadedBallValve.jpg",
       "categories": ["Valves", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "valves",
     },
     //Reducers
     {
@@ -5604,6 +9074,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper Fitting for reducing from 2in. copper pipe to 1 1/2in. copper pipe (Brand may very)",
       "image": "assets/images/Copper1inTo.75inReducer.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. x 1 in. Copper Reducer",
@@ -5612,6 +9083,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper Fitting for reducing from 2in. copper pipe to 1in. copper pipe (Brand may very)",
       "image": "assets/images/Copper2inTo1inReducer.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 1/2 in. x 3/4 in. Copper Reducer",
@@ -5620,6 +9092,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper Fitting for reducing from 1 1/2in. copper pipe to 3/4in. copper pipe (Brand may very)",
       "image": "assets/images/Copper2inTo1inReducer.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 3/4 in. Copper Reducer",
@@ -5628,6 +9101,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper Fitting for reducing from 1in. copper pipe to 3/4in. copper pipe (Brand may very)",
       "image": "assets/images/Copper1inTo.75inReducer.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 1/2 in. Copper Reducer",
@@ -5636,6 +9110,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Copper Fitting for reducing from 1in. copper pipe to 1/2in. copper pipe (Brand may very)",
       "image": "assets/images/Copper2inTo1inReducer.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     //Reducing Tees
     {
@@ -5645,6 +9120,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 2in. x 1in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx1inx.5inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. x 2 in. x 1 in. ProPress Copper Reducing Tee",
@@ -5653,6 +9129,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 2in. x 1in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx1inx.5inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "2 in. x 1 in. x 2 in. Copper Reducing Tee",
@@ -5661,6 +9138,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 1in. x 2in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx.5inx1inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. x 1 in. x 2 in. ProPress Copper Reducing Tee",
@@ -5669,6 +9147,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 1in. x 2in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx.5inx1inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "2 in. x 1 in. x 1 in. Copper Reducing Tee",
@@ -5677,6 +9156,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 1in. x 1in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx.5inx.5inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. x 1 in. x 1 in. ProPress Copper Reducing Tee",
@@ -5685,6 +9165,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 1in. x 1in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx.5inx.5inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. x 1 in. x 2 in. Copper Reducing Tee",
@@ -5693,6 +9174,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1in. x 2in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe (Brand may very)",
       "image": "assets/images/Copper.5inx.5inx1inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 1 in. x 2 in. ProPress Copper Reducing Tee",
@@ -5701,6 +9183,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1in. x 2in. Copper Fitting for reducing from 2in. copper pipe to 1in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper.5inx.5inx1inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "2 in. x 2 in. x 1/2 in. Copper Reducing Tee",
@@ -5709,6 +9192,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 2in. x 1/2in. Copper Fitting for reducing from 2in. copper pipe to 1/2in. pipe (Brand may very)",
       "image": "assets/images/Copper2inx2inx.5inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. x 2 in. x 1/2 in. ProPress Copper Reducing Tee",
@@ -5717,6 +9201,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 2in. x 1/2in. Copper Fitting for reducing from 2in. copper pipe to 1/2in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper2inx2inx.5inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. x 1 in. x 3/4 in. Copper Reducing Tee",
@@ -5725,6 +9210,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. x 2in. x 2/4in. Copper Fitting for reducing from 1in. copper pipe to 3/4in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx1inx.75inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 1 in. x 3/4 in. ProPress Copper Reducing Tee",
@@ -5733,6 +9219,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1in. x 3/4in. Copper Fitting for reducing from 1in. copper pipe to 3/4in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx1inx.75inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. x 3/4 in. x 1 in.  Copper Reducing Tee",
@@ -5741,6 +9228,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4in. x 3/4in. x 1in. Copper Fitting for reducing from 1in. copper pipe to 3/4in. pipe (Brand may very)",
       "image": "assets/images/Copper.75inx.75inx1inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "3/4 in. x 3/4 in. x 1 in. ProPress Copper Reducing Tee",
@@ -5749,6 +9237,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4in. x 3/4in. x 1in. Copper Fitting for reducing from 1in. copper pipe to 3/4in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper.75inx.75inx1inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. x 1 in. x 1/2 in. Copper Reducing Tee",
@@ -5757,6 +9246,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1in. x 1/2in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx1inx.5inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 1 in. x 1/2 in. ProPress Copper Reducing Tee",
@@ -5765,6 +9255,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1in. x 1/2in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx1inx.5inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1 in. x 1/2 in. x 1/2 in. Copper Reducing Tee",
@@ -5773,6 +9264,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1/2in. x 1/2in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx.5inx.5inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1 in. x 1/2 in. x 1/2 in. ProPress Copper Reducing Tee",
@@ -5781,6 +9273,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. x 1/2in. x 1/2in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper1inx.5inx.5inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "1/2 in. x 1/2 in. x 1 in. Copper Reducing Tee",
@@ -5789,6 +9282,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2in. x 1/2in. x 1in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe (Brand may very)",
       "image": "assets/images/Copper.5inx.5inx1inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "1/2 in. x 1/2 in. x 1 in. ProPress Copper Reducing Tee",
@@ -5797,6 +9291,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2in. x 1/2in. x 1in. Copper Fitting for reducing from 1in. copper pipe to 1/2in. pipe with a propress (Brand may very)",
       "image": "assets/images/Copper.5inx.5inx1inProPressTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "propress",
     },
     {
       "name": "3/4 in. x 1/2 in. x 3/4 in. Copper Reducing Tee",
@@ -5805,6 +9300,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4in. x 1/2in. x 3/4in. Copper Fitting for reducing from 3/4in. copper pipe to 1/2in. pipe (Brand may very)",
       "image": "assets/images/Copper1inx.75inx1inTee.jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
     },
     {
       "name": "2 in. Swing Check Valve (Non-Threaded)",
@@ -5812,6 +9308,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "2 in. Swing Check Valve (Threaded)",
@@ -5819,6 +9316,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 1/2 in. Swing Check Valve (Non-Threaded)",
@@ -5826,6 +9324,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 1/2 in. Swing Check Valve (Threaded)",
@@ -5833,6 +9332,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Swing Check Valve (Non-Threaded)",
@@ -5840,6 +9340,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Swing Check Valve (Threaded)",
@@ -5847,6 +9348,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Swing Check Valve (Non-Threaded)",
@@ -5854,6 +9356,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Swing Check Valve (Threaded)",
@@ -5861,6 +9364,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Swing Check Valve (Non-Threaded)",
@@ -5868,6 +9372,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Swing Check Valve (Threaded)",
@@ -5875,6 +9380,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SwingCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "2 in. Spring Check Valve (Non-Threaded)",
@@ -5882,6 +9388,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "2 in. Spring Check Valve (Threaded)",
@@ -5889,6 +9396,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 1/2 in. Spring Check Valve (Non-Threaded)",
@@ -5896,6 +9404,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 1/2 in. Spring Check Valve (Threaded)",
@@ -5903,6 +9412,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Spring Check Valve (Non-Threaded)",
@@ -5910,6 +9420,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1 in. Spring Check Valve (Threaded)",
@@ -5917,6 +9428,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Spring Check Valve (Non-Threaded)",
@@ -5924,6 +9436,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "3/4 in. Spring Check Valve (Threaded)",
@@ -5931,6 +9444,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Spring Check Valve (Non-Threaded)",
@@ -5938,6 +9452,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(NonThreaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "1/2 in. Spring Check Valve (Threaded)",
@@ -5945,6 +9460,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. swing check valve (Brand may very)",
       "image": "assets/images/SpringCheckValve(Threaded).jpg",
       "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "Shower Valve(Threaded)",
@@ -5952,6 +9468,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. threaded port shower valve (Brand may very)",
       "image": "assets/images/ShowerValve(Threaded).jpg",
       "categories": ["Valves", "Bathroom"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "Shower Valve(Non-Threaded)",
@@ -5959,6 +9476,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. non threaded port shower valve (Brand may very)",
       "image": "assets/images/ShowerValve(NonThreaded).jpg",
       "categories": ["Valves", "Bathroom"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "Speedy Valve 1/2 in. Compression Outlet",
@@ -5967,6 +9485,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Toilet water supply shut off valve with compression fittings and 1/2 in. outlet to tank (Brand may very)",
       "image": "assets/images/SpeedyValve.jpg",
       "categories": ["Bathroom", "Valves"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "Speedy Valve 3/8 in. Compression Outlet",
@@ -5975,6 +9494,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Toilet water supply shut off valve with compression fittings and 3/8 in. outlet to tank (Brand may very)",
       "image": "assets/images/SpeedyValve.jpg",
       "categories": ["Bathroom", "Valves"],
+      "specialtyStoreTag": "valves",
     },
     {
       "name": "Sink Supply Line (3/8 in. x 1/2 in. FIP)",
@@ -5983,6 +9503,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 1/2 in. FIP sink supply line 9 or 12 inches long depending on stock (Brand may very)",
       "image": "assets/images/SinkSupplyLineFIP.jpg",
       "categories": ["Bathroom", "Kitchen"],
+      "specialtyStoreTag": "supplyLines",
     },
     {
       "name": "Sink Supply Line (3/8 in. x 1/2 in. FIP x 20 in.)",
@@ -5991,6 +9512,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 1/2 in. FIP sink supply line 20 in. long (Brand may very)",
       "image": "assets/images/SinkSupplyLineFIP.jpg",
       "categories": ["Bathroom", "Kitchen"],
+      "specialtyStoreTag": "supplyLines",
     },
     {
       "name": "Sink Supply Line (3/8 in. x 3/8 in.)",
@@ -5999,6 +9521,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 3/8 in. compression sink supply line 9 or 12 inches long depending on stock (Brand may very)",
       "image": "assets/images/SinkSupplyLine.jpg",
       "categories": ["Bathroom", "Kitchen"],
+      "specialtyStoreTag": "supplyLines",
     },
     {
       "name": "Sink Supply Line (3/8 in. x 3/8 in. x 20 in.)",
@@ -6007,6 +9530,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 3/8 in. compression sink supply line 20 in. long (Brand may very)",
       "image": "assets/images/SinkSupplyLine.jpg",
       "categories": ["Bathroom", "Kitchen"],
+      "specialtyStoreTag": "supplyLines",
     },
     {
       "name": "0 Washers (Pack of 10)",
@@ -6015,6 +9539,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Washers for hot/cold water valves on a sink (Brand may very)",
       "image": "assets/images/0Washers.jpg",
       "categories": ["Sinks"],
+      "specialtyStoreTag": "sinkRepair",
     },
     {
       "name": "00 Washers (Pack of 10)",
@@ -6023,6 +9548,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Washers for hot/cold water valves on a sink (Brand may very)",
       "image": "assets/images/00Washers.jpg",
       "categories": ["Sinks"],
+      "specialtyStoreTag": "sinkRepair",
     },
     {
       "name": "Toilet Supply Line (1/2 in. x 7/8 in.)",
@@ -6031,6 +9557,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. compression connector x 7/8 in. Toilet supply line 9 or 12 inches long depending on stock (Brand may very)",
       "image": "assets/images/CompressionToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Supply Line (1/2 in. FIP x 7/8 in.)",
@@ -6039,6 +9566,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. FIP  x 7/8 in. Toilet supply line 9 or 12 inches long depending on stock (Brand may very)",
       "image": "assets/images/FIPToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Supply Line (1/2 in. x 7/8 in. x 20 in.)",
@@ -6047,6 +9575,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. compression x 7/8 in. Toilet supply line 20 in. long (Brand may very)",
       "image": "assets/images/CompressionToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Supply Line (1/2 in. FIP x 7/8 in. x 20 in.)",
@@ -6055,6 +9584,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. FIP x 7/8 in. Toilet supply line 20 in. long (Brand may very)",
       "image": "assets/images/FIPToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Supply Line (3/8 in. x 7/8 in.)",
@@ -6063,6 +9593,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 7/8 in. Toilet supply line 9 or 12 inches long depending on stock (Brand may very)",
       "image": "assets/images/ToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Supply Line (3/8 in. x 7/8 in. x 20 in.)",
@@ -6071,6 +9602,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/8 in. compression x 7/8 in. Toilet supply line 20 in. long (Brand may very)",
       "image": "assets/images/ToiletSupplyLine.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Handle With Chain",
@@ -6079,6 +9611,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Handle with chain mechanism for toilet with flapper (Brand may very)",
       "image": "assets/images/ToiletHandle.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet Flapper",
@@ -6086,6 +9619,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Rubber flapper for toilet flush  (Brand may very)",
       "image": "assets/images/Flapper.jpg",
       "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "3 in. Black Iron Pipe Coupling",
@@ -6093,6 +9627,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe Cap",
@@ -6101,6 +9636,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe 45 degree Elbow",
@@ -6109,6 +9645,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe 90 degree Elbow",
@@ -6117,6 +9654,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe Nipple",
@@ -6124,6 +9662,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe Tee",
@@ -6132,6 +9671,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe Union Fiting",
@@ -6140,6 +9680,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe Coupling",
@@ -6148,6 +9689,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe Cap",
@@ -6156,6 +9698,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe 45 degree Elbow",
@@ -6164,6 +9707,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe 90 degree Elbow",
@@ -6172,6 +9716,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe Nipple",
@@ -6180,6 +9725,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe Tee",
@@ -6188,6 +9734,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2  in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2  in. Black Iron Pipe Union Fiting",
@@ -6196,6 +9743,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 1/2 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe Coupling",
@@ -6203,6 +9751,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe Cap",
@@ -6211,6 +9760,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe 45 degree Elbow",
@@ -6219,6 +9769,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe 90 degree Elbow",
@@ -6227,6 +9778,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe Nipple",
@@ -6234,6 +9786,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe Tee",
@@ -6242,6 +9795,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. Black Iron Pipe Union Fiting",
@@ -6250,6 +9804,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe Coupling",
@@ -6258,6 +9813,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe Cap",
@@ -6266,6 +9822,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe 45 degree Elbow",
@@ -6274,6 +9831,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe 90 degree Elbow",
@@ -6282,6 +9840,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe Nipple",
@@ -6290,6 +9849,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe Tee",
@@ -6298,6 +9858,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. Black Iron Pipe Union Fiting",
@@ -6306,6 +9867,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe Coupling",
@@ -6314,6 +9876,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe Cap",
@@ -6322,6 +9885,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe 45 degree Elbow",
@@ -6330,6 +9894,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe 90 degree Elbow",
@@ -6338,6 +9903,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe Nipple",
@@ -6346,6 +9912,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe Tee",
@@ -6354,6 +9921,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. Black Iron Pipe Union Fiting",
@@ -6362,6 +9930,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe Coupling",
@@ -6369,6 +9938,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe Cap",
@@ -6377,6 +9947,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe 45 degree Elbow",
@@ -6385,6 +9956,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe 90 degree Elbow",
@@ -6393,6 +9965,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe Nipple",
@@ -6400,6 +9973,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe Tee",
@@ -6408,6 +9982,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. Black Iron Pipe Union Fiting",
@@ -6416,6 +9991,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe Coupling",
@@ -6424,6 +10000,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Cap",
@@ -6432,6 +10009,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe 45 degree Elbow",
@@ -6440,6 +10018,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe 90 degree Elbow",
@@ -6448,6 +10027,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe Nipple",
@@ -6455,6 +10035,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3/4 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe Tee",
@@ -6463,6 +10044,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. Black Iron Pipe Union Fiting",
@@ -6471,6 +10053,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3/4 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Coupling",
@@ -6479,6 +10062,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. Black iron coupling for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCoupling.jpg",
       "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Cap",
@@ -6487,6 +10071,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. Threaded black iron cap for gas line (Brand may very)",
       "image": "assets/images/BlackPipeCap.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe 45 degree Elbow",
@@ -6495,6 +10080,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. black iron 45 degree fitting for gas line (Brand may very)",
       "image": "assets/images/BlackPipe45.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe 90 degree Elbow",
@@ -6503,6 +10089,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. black iron 90 degree elbow for gas line (Brand may very)",
       "image": "assets/images/BlackPipe90.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Nipple",
@@ -6510,6 +10097,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. black steel nipple for gas line (Brand may very)",
       "image": "assets/images/BlackPipeNipple.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Tee",
@@ -6518,6 +10106,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. black iron tee for connecting threaded steel pipe (Brand may very)",
       "image": "assets/images/BlackPipeTee.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. Black Iron Pipe Union Fiting",
@@ -6526,6 +10115,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1/2 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
       "image": "assets/images/BlackPipeUnion.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     //REDUCERS + Bushings
     {
@@ -6535,6 +10125,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 3 in. to 2 1/2 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe3inTo2.5inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 2 in. Black Iron Reducer Fitting",
@@ -6543,6 +10134,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3Black iron fitting for reducing from 3 in. to 2 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe3inTo2inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 1/2 in. Black Iron Reducer Fitting",
@@ -6551,6 +10143,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 2 in. to 2 1/2 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe2inTo1.5inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 in. Black Iron Reducer Fitting",
@@ -6559,6 +10152,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 2 in. to 1 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe2inTo1inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1 in. Black Iron Reducer Fitting",
@@ -6567,6 +10161,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 1 1/2 in. to 1 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe1.5inTo1inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 3/4 in. Black Iron Reducer Fitting",
@@ -6575,6 +10170,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 1 1/4 in. to 3/4 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe1.25inTo.75inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/2 in. Black Iron Reducer Fitting",
@@ -6583,6 +10179,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 1 in. to 1/2 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe1inTo.5inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/4 in. Black Iron Reducer Fitting",
@@ -6591,6 +10188,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Black iron fitting for reducing from 3/4 in. to 1/4 in. pipe (Brand may very)",
       "image": "assets/images/BlackPipe.75inTo.25inReducer.jpg",
       "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     //BUSHINGS
     {
@@ -6606,6 +10204,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 2 in. Black Iron Reducing Bushing",
@@ -6620,6 +10219,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 1 in. Black Iron Reducing Bushing",
@@ -6634,6 +10234,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 2 in. Black Iron Reducing Bushing",
@@ -6648,6 +10249,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 1/2 in. Black Iron Reducing Bushing",
@@ -6662,6 +10264,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 1/4 in. Black Iron Reducing Bushing",
@@ -6676,6 +10279,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 in. Black Iron Reducing Bushing",
@@ -6690,6 +10294,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 3/4 in. Black Iron Reducing Bushing",
@@ -6704,6 +10309,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6718,6 +10324,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 1/2 in. Black Iron Reducing Bushing",
@@ -6732,6 +10339,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 in. Black Iron Reducing Bushing",
@@ -6746,6 +10354,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 3/4 in. Black Iron Reducing Bushing",
@@ -6760,6 +10369,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6774,6 +10384,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1 1/4 in. Black Iron Reducing Bushing",
@@ -6788,6 +10399,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1 in. Black Iron Reducing Bushing",
@@ -6802,6 +10414,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 3/4 in. Black Iron Reducing Bushing",
@@ -6816,6 +10429,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6830,6 +10444,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1/4 in. Black Iron Reducing Bushing",
@@ -6844,6 +10459,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 1 in. Black Iron Reducing Bushing",
@@ -6858,6 +10474,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 3/4 in. Black Iron Reducing Bushing",
@@ -6872,6 +10489,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6886,6 +10504,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 1/4 in. Black Iron Reducing Bushing",
@@ -6900,6 +10519,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 3/4 in. Black Iron Reducing Bushing",
@@ -6914,6 +10534,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6928,6 +10549,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/4 in. Black Iron Reducing Bushing",
@@ -6942,6 +10564,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/8 in. Black Iron Reducing Bushing",
@@ -6956,6 +10579,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/2 in. Black Iron Reducing Bushing",
@@ -6970,6 +10594,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/4 in. Black Iron Reducing Bushing",
@@ -6984,6 +10609,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/8 in. Black Iron Reducing Bushing",
@@ -6998,6 +10624,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. to 1/4 in. Black Iron Reducing Bushing",
@@ -7012,6 +10639,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. to 1/8 in. Black Iron Reducing Bushing",
@@ -7026,6 +10654,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/4 in. to 1/8 in. Black Iron Reducing Bushing",
@@ -7040,6 +10669,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Bushings",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 2 in. Black Iron Reducing Elbow",
@@ -7054,6 +10684,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 2 1/2 in. Black Iron Reducing Elbow",
@@ -7068,6 +10699,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. to 1 in. Black Iron Reducing Elbow",
@@ -7082,6 +10714,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 2 in. Black Iron Reducing Elbow",
@@ -7096,6 +10729,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 1/2 in. Black Iron Reducing Elbow",
@@ -7110,6 +10744,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 1/4 in. Black Iron Reducing Elbow",
@@ -7124,6 +10759,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 1 in. Black Iron Reducing Elbow",
@@ -7138,6 +10774,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 1/2 in. to 3/4 in. Black Iron Reducing Elbow",
@@ -7152,6 +10789,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     /*{
       "name": "2 1/2 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7180,6 +10818,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 1/2 in. Black Iron Reducing Elbow",
@@ -7194,6 +10833,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1 in. Black Iron Reducing Elbow",
@@ -7208,6 +10848,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 3/4 in. Black Iron Reducing Elbow",
@@ -7222,6 +10863,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "2 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7236,6 +10878,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1 1/4 in. Black Iron Reducing Elbow",
@@ -7250,6 +10893,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1 in. Black Iron Reducing Elbow",
@@ -7264,6 +10908,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 3/4 in. Black Iron Reducing Elbow",
@@ -7278,6 +10923,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/2 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7292,6 +10938,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 1 in. Black Iron Reducing Elbow",
@@ -7306,6 +10953,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 3/4 in. Black Iron Reducing Elbow",
@@ -7320,6 +10968,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 1/4 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7334,6 +10983,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 3/4 in. Black Iron Reducing Elbow",
@@ -7348,6 +10998,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7362,6 +11013,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1 in. to 1/4 in. Black Iron Reducing Elbow",
@@ -7376,6 +11028,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/2 in. Black Iron Reducing Elbow",
@@ -7390,6 +11043,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/4 in. Black Iron Reducing Elbow",
@@ -7404,6 +11058,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3/4 in. to 1/8 in. Black Iron Reducing Elbow",
@@ -7418,6 +11073,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. to 1/4 in. Black Iron Reducing Elbow",
@@ -7432,6 +11088,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/2 in. to 1/8 in. Black Iron Reducing Elbow",
@@ -7446,6 +11103,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "1/4 in. to 1/8 in. Black Iron Reducing Elbow",
@@ -7460,6 +11118,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "Elbows/90s",
         "Reducers",
       ],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "Pipe Dope (8 oz.)",
@@ -7468,6 +11127,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Paste for sealing pipe connections from leaks (Brand may very)",
       "image": "assets/images/PipeDope.jpg",
       "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "pipeSealants",
     },
     {
       "name": "4 in. Rubber Gasket",
@@ -7476,6 +11136,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Rubber gasket for installing 4 in. pipe into existing cast iron(Brand may very)",
       "image": "assets/images/2inRubberGasket.jpg",
       "categories": ["PVC", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "4 in. Shielded Rubber Coupling",
@@ -7484,6 +11145,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Rubber coupling for conneting drain pipe (Brand may very)",
       "image": "assets/images/Shielded2inRubberCoupling.jpg",
       "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "4 in. Heavy Duty Shielded Rubber Coupling",
@@ -7492,6 +11154,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Shielded rubber coupling for conneting drain pipe (Brand may very)",
       "image": "assets/images/HeavyDutyRubberCoupling(3or4in).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "4 in. Rubber Cap",
@@ -7500,6 +11163,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. rubber cap for PVC or Cast iron pipe (Brand may very)",
       "image": "assets/images/RubberCap.jpg",
       "categories": ["NoHub", "Drains", "PVC"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. 45",
@@ -7507,6 +11171,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. Cast iron 45 (Brand may very)",
       "image": "assets/images/NoHub45.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. Cleanout",
@@ -7514,6 +11179,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. Cast iron cleanout without cap (Brand may very)",
       "image": "assets/images/NoHubCleanout.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. Sanitary Tee",
@@ -7522,6 +11188,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Cast iron santary tee for drain piping (Brand may very)",
       "image": "assets/images/NoHubSanitaryTee.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. Long Sweep Elbow",
@@ -7530,6 +11197,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Cast iron elbow with a large bend for better flow (Brand may very)",
       "image": "assets/images/NoHubLongSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. Short Sweep Elbow",
@@ -7538,6 +11206,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. Cast iron elbow with a slighly larger bend for better flow (Brand may very)",
       "image": "assets/images/NoHubShortSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. Wye",
@@ -7545,6 +11214,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. Cast iron wye (Brand may very)",
       "image": "assets/images/NoHubWye.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 4 in. To 3 in. Reducer",
@@ -7552,6 +11222,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. Cast iron to 3 in. reducer (Brand may very)",
       "image": "assets/images/NoHubReducer(1).jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "3 in. Rubber Gasket",
@@ -7560,6 +11231,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Rubber gasket for installing 3in. pipe into existing cast iron(Brand may very)",
       "image": "assets/images/2inRubberGasket.jpg",
       "categories": ["PVC", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "3 in. Shielded Rubber Coupling",
@@ -7568,6 +11240,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Rubber coupling for conneting drain pipe(Brand may very)",
       "image": "assets/images/Shielded2inRubberCoupling.jpg",
       "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "3 in. Heavy Duty Shielded Rubber Coupling",
@@ -7576,6 +11249,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Shielded rubber coupling for conneting drain pipe(Brand may very)",
       "image": "assets/images/HeavyDutyRubberCoupling(2inOrLower).jpg",
       "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "3 in. Rubber Cap",
@@ -7584,6 +11258,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. rubber cap for PVC or Cast iron pipe (Brand may very)",
       "image": "assets/images/RubberCap.jpg",
       "categories": ["NoHub", "Drains", "PVC"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. 45",
@@ -7591,6 +11266,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. Cast iron 45 (Brand may very)",
       "image": "assets/images/NoHub45.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. Cleanout",
@@ -7598,6 +11274,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. Cast iron cleanout without cap (Brand may very)",
       "image": "assets/images/NoHubCleanout.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. Sanitary Tee",
@@ -7606,6 +11283,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Cast iron santary tee for drain piping (Brand may very)",
       "image": "assets/images/NoHubSanitaryTee.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. Long Sweep Elbow",
@@ -7614,6 +11292,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Cast iron elbow with a large bend for better flow (Brand may very)",
       "image": "assets/images/NoHubLongSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. Short Sweep Elbow",
@@ -7622,6 +11301,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. Cast iron elbow with a slighly larger bend for better flow (Brand may very)",
       "image": "assets/images/NoHubShortSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. Wye",
@@ -7629,6 +11309,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. Cast iron wye (Brand may very)",
       "image": "assets/images/NoHubWye.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 3 in. To 2 in. Reducer",
@@ -7636,6 +11317,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. Cast iron to 2 in. reducer (Brand may very)",
       "image": "assets/images/NoHubReducer(1).jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "2 in. Rubber Gasket",
@@ -7644,6 +11326,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Rubber gasket for installing 2in. pipe into existing cast iron(Brand may very)",
       "image": "assets/images/2inRubberGasket.jpg",
       "categories": ["PVC", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "2 in. Shielded Rubber Coupling",
@@ -7652,6 +11335,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Rubber coupling for conneting drain pipe(Brand may very)",
       "image": "assets/images/Shielded2inRubberCoupling.jpg",
       "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "2 in. Heavy Duty Shielded Rubber Coupling",
@@ -7660,6 +11344,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Shielded rubber coupling for conneting drain pipe(Brand may very)",
       "image": "assets/images/HeavyDutyRubberCoupling(2inOrLower).jpg",
       "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "2 in. Rubber Cap",
@@ -7668,6 +11353,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. rubber cap for PVC or Cast iron pipe (Brand may very)",
       "image": "assets/images/RubberCap.jpg",
       "categories": ["NoHub", "Drains", "PVC"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. 45",
@@ -7675,6 +11361,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. Cast iron 45 (Brand may very)",
       "image": "assets/images/NoHub45.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. Cleanout",
@@ -7682,6 +11369,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. Cast iron cleanout without cap (Brand may very)",
       "image": "assets/images/NoHubCleanout.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. Sanitary Tee",
@@ -7690,6 +11378,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Cast iron santary tee for drain piping (Brand may very)",
       "image": "assets/images/NoHubSanitaryTee.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. Long Sweep Elbow",
@@ -7698,6 +11387,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Cast iron elbow with a large bend for better flow (Brand may very)",
       "image": "assets/images/NoHubLongSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. Short Sweep Elbow",
@@ -7706,6 +11396,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. Cast iron elbow with a slighly larger bend for better flow (Brand may very)",
       "image": "assets/images/NoHubShortSweepElbow.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "No Hub 2 in. Wye",
@@ -7713,6 +11404,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. Cast iron wye (Brand may very)",
       "image": "assets/images/NoHubWye.jpg",
       "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
     },
     {
       "name": "Purple Primer (8 oz.)",
@@ -7721,6 +11413,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Purple CPVC/PVC primer for cleaning connections(Brand may very)",
       "image": "assets/images/PurplePrimer.jpg",
       "categories": ["PVC"],
+      "specialtyStoreTag": "pipeSealants",
     },
     {
       "name": "Clear Primer (8 oz.)",
@@ -7729,6 +11422,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Clear CPVC/PVC primer for cleaning connections(Brand may very)",
       "image": "assets/images/ClearPrimer.jpg",
       "categories": ["PVC"],
+      "specialtyStoreTag": "pipeSealants",
     },
     {
       "name": "PVC Cement (8 oz.)",
@@ -7736,6 +11430,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Clear CPVC/PVC cement for connections(Brand may very)",
       "image": "assets/images/PVCCement.jpg",
       "categories": ["PVC"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC Cutting Bit",
@@ -7744,6 +11439,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Bit for cutting pvc in out of reach areas(Brand may very)",
       "image": "assets/images/PVCCuttingBit.jpg",
       "categories": ["PVC", "Tools"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. NonSlip Coupling",
@@ -7751,6 +11447,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC Coupling with internal stops(Brand may very)",
       "image": "assets/images/PVCCoupling(HUB).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. Slip Coupling",
@@ -7759,6 +11456,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. PVC Coupling without internal stops(Brand may very)",
       "image": "assets/images/PVCSlipCoupling.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. 45",
@@ -7766,6 +11464,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC 45 (Brand may very)",
       "image": "assets/images/PVC45.jpg",
       "categories": ["PVC   ", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. 90",
@@ -7773,6 +11472,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC 90 (Brand may very)",
       "image": "assets/images/PVC90.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. Cleanout With Plug",
@@ -7780,6 +11480,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC cleanout with plug (Brand may very)",
       "image": "assets/images/PVCCleanoutWithCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. Threaded Cap",
@@ -7787,6 +11488,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC cleanout cap(Brand may very)",
       "image": "assets/images/PVCThreadedCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. Sanitary Tee",
@@ -7794,6 +11496,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC santary tee for drain piping (Brand may very)",
       "image": "assets/images/PVCSanitaryTee.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. Wye",
@@ -7801,6 +11504,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC wye (Brand may very)",
       "image": "assets/images/PVCWye.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 4 in. To 3 in. Reducer",
@@ -7808,6 +11512,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "4 in. PVC to 3 in. reducer (Brand may very)",
       "image": "assets/images/PVCReducer(NoHub).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. NonSlip Coupling",
@@ -7815,6 +11520,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC Coupling with internal stops(Brand may very)",
       "image": "assets/images/PVCCoupling(HUB).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. Slip Coupling",
@@ -7823,6 +11529,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. PVC Coupling without internal stops(Brand may very)",
       "image": "assets/images/PVCSlipCoupling.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. 45",
@@ -7830,6 +11537,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC 45 (Brand may very)",
       "image": "assets/images/PVC45.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. 90",
@@ -7837,6 +11545,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC 90 (Brand may very)",
       "image": "assets/images/PVC90.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. Cleanout",
@@ -7844,6 +11553,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC cleanout with plug (Brand may very)",
       "image": "assets/images/PVCCleanoutWithCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. Threaded Cap",
@@ -7851,6 +11561,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC cleanout cap(Brand may very)",
       "image": "assets/images/PVCThreadedCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. Sanitary Tee",
@@ -7858,6 +11569,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC sanitary tee for drain piping (Brand may very)",
       "image": "assets/images/PVCSanitaryTee.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. Wye",
@@ -7865,6 +11577,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC wye (Brand may very)",
       "image": "assets/images/PVCWye.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 3 in. To 2 in. Reducer",
@@ -7872,6 +11585,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. PVC to 2 in. reducer (Brand may very)",
       "image": "assets/images/PVCReducer(NoHub).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. NonSlip Coupling",
@@ -7879,6 +11593,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC Coupling with internal stops (Brand may very)",
       "image": "assets/images/PVCCoupling(HUB).jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. Slip Coupling",
@@ -7887,6 +11602,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. PVC Coupling without internal stops (Brand may very)",
       "image": "assets/images/PVCSlipCoupling.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. 45",
@@ -7894,6 +11610,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC 45 (Brand may very)",
       "image": "assets/images/PVC45.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. 90",
@@ -7901,6 +11618,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC 90 (Brand may very)",
       "image": "assets/images/PVC90.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. Cleanout",
@@ -7908,6 +11626,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. Cast iron cleanout with plug (Brand may very)",
       "image": "assets/images/PVCCleanoutWithCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. Threaded Cap",
@@ -7915,6 +11634,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC cleanout cap (Brand may very)",
       "image": "assets/images/PVCThreadedCap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. Sanitary Tee",
@@ -7922,6 +11642,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC saitary tee for drain piping (Brand may very)",
       "image": "assets/images/PVCSanitaryTee.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. Wye",
@@ -7929,6 +11650,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC wye (Brand may very)",
       "image": "assets/images/PVCWye.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. PTrap",
@@ -7936,6 +11658,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "2 in. PVC p-trap without nut (Brand may very)",
       "image": "assets/images/PVCPTrap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "PVC 2 in. PTrap With Union",
@@ -7944,6 +11667,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2 in. PVC p-trap with nut and threaded connection (Brand may very)",
       "image": "assets/images/PVCPTrap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "2 in. Shower Drain",
@@ -7951,6 +11675,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Shower Drain fits over 2 in. pvc pipe (Brand may very)",
       "image": "assets/images/ShowerDrain.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "Plumber's Putty (14 oz.)",
@@ -7958,6 +11683,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Putty for waterproofing drains (Brand may very)",
       "image": "assets/images/PlumbersPutty.jpg",
       "categories": ["Drains"],
+      "specialtyStoreTag": "pipeSealants",
     },
     {
       "name": "1 1/2 in. Chrome Plated Tailpipe Assembly",
@@ -7966,6 +11692,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. tailpipe with opening and closing mechanism for sink drain (Brand may very)",
       "image": "assets/images/ChromePlatedSinkDrainAssembly.jpg",
       "categories": ["Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/2 in. PVC Tailpipe",
@@ -7974,6 +11701,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. tailpipe with opening and closing mechanism for sink drain (Brand may very)",
       "image": "assets/images/PVCTailPipe.25.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/4 in. Chrome Plated Tailpipe Assembly",
@@ -7982,6 +11710,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. tailpipe with opening and closing mechanism for sink drain (Brand may very)",
       "image": "assets/images/ChromePlatedSinkDrainAssembly.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/4 in. PVC TailPipe",
@@ -7990,6 +11719,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. threaded PVC tailpipe for sink drain (Brand may very)",
       "image": "assets/images/PVCTailPipe.25.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/2 in. To 1 1/4 in. Plastic Reducing Bushing",
@@ -7998,6 +11728,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "PLastic bushing for reducing from 1 1/2in. drain pipe to 1 1/4in. trap/pipe (Brand may very)",
       "image": "assets/images/PVCTailPipe.25.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "generalPlumbing",
     },
     {
       "name": "1 1/2 in. Chrome Plated P-Trap",
@@ -8005,6 +11736,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. chrome plated p-trap (Brand may very)",
       "image": "assets/images/ChromePlatedPTrap.jpg",
       "categories": ["Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/2 in. PVC P-Trap",
@@ -8012,6 +11744,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/2 in. PVC p-trap (Brand may very)",
       "image": "assets/images/PVCP-Trap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/4 in. Chrome Plated P-Trap ",
@@ -8019,6 +11752,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/4 in. chrome plated p-trap (Brand may very)",
       "image": "assets/images/ChromePlatedPTrap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/4 in. PVC P-Trap",
@@ -8026,6 +11760,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 1/4 in. PVC p-trap (Brand may very)",
       "image": "assets/images/PVCP-Trap.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/2 in. PVC Trap Adapter",
@@ -8034,6 +11769,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Adapter to fit a p trap into 1 1/2 in. pvc pipe (Brand may very)",
       "image": "assets/images/PVCTrapAdapter.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/2 in. x 4 in. MPT Galvanized Nipple",
@@ -8042,6 +11778,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. x 4 in. male pipe thread galvanized nipple for P-trap or other uses (Brand may very)",
       "image": "assets/images/MPT4inGalvanizedNipple.jpg",
       "categories": ["Fittings", "Drains"],
+      "specialtyStoreTag": "generalPlumbing",
     },
     {
       "name": "1 1/2 in. x 6 in. MPT Galvanized Nipple",
@@ -8050,6 +11787,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. x 6 in. male pipe thread galvanized nipple for P-trap or other uses (Brand may very)",
       "image": "assets/images/MPT4inGalvanizedNipple.jpg",
       "categories": ["Fittings", "Drains"],
+      "specialtyStoreTag": "generalPlumbing",
     },
     {
       "name": "1 1/2 in. PTrap Slip Nut",
@@ -8058,6 +11796,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Nut with a rubber reducer to fit a 1 1/2 p trap trap into 1 1/2 in. MPT nipple (Brand may very)",
       "image": "assets/images/PTrapSlipNut.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "1 1/4 in. PTrap Slip Nut",
@@ -8066,6 +11805,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Nut with a rubber reducer to fit a 1 1/4 p trap trap into 1 1/4 in. MPT nipple (Brand may very)",
       "image": "assets/images/PTrapSlipNut.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "3 in. PVC Toilet Flange",
@@ -8074,6 +11814,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. wide fitting for connecting toilet to drain (Brand may very)",
       "image": "assets/images/PVCToiletFlange.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "3 in. PVC Toilet Flange With Stainless Steel Ring",
@@ -8082,6 +11823,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. wide fitting for connecting toilet to drain (Brand may very)",
       "image": "assets/images/PVCToiletFlangeWithMetalRing.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "pvcDrainage",
     },
     {
       "name": "4 in. x 2 in. Cast Iron Toilet Flange",
@@ -8090,6 +11832,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. wide code blue cast iron toilet flange (Brand may very)",
       "image": "assets/images/CastIronToiletFlange(4inx2in).jpg",
       "categories": ["Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "4 in. Wax Ring",
@@ -8097,6 +11840,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. wax ring for toilet drains (Brand may very)",
       "image": "assets/images/WaxRing.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "4 in. Wax Ring With Horn",
@@ -8105,6 +11849,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4 in. wax ring for toilet drains with black horn (Brand may very)",
       "image": "assets/images/WaxRingWithHorn.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "3 in. Wax Ring",
@@ -8112,6 +11857,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "3 in. wax ring for toilet drains (Brand may very)",
       "image": "assets/images/WaxRing.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "3 in. Wax Ring With Horn",
@@ -8120,6 +11866,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3 in. wax ring for toilet drains with black horn (Brand may very)",
       "image": "assets/images/WaxRingWithHorn.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "Toilet/Closet Bolts",
@@ -8128,6 +11875,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Bolts, nuts, and washers for fastening toilet to toilet drain flange (Brand may very)",
       "image": "assets/images/JonnyBolts.jpg",
       "categories": ["PVC", "Drains"],
+      "specialtyStoreTag": "toiletRepair",
     },
     {
       "name": "4 in. Hole Saw",
@@ -8136,6 +11884,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "4in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "3 in. Hole Saw",
@@ -8144,6 +11893,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "3in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "2 in. Hole Saw",
@@ -8152,6 +11902,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "2in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "1 1/2 in. Hole Saw",
@@ -8160,6 +11911,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/2 in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "1 1/4 in. Hole Saw",
@@ -8168,6 +11920,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1 1/4 in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "1 in. Hole Saw",
@@ -8176,6 +11929,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "1in. circular blade for cutting holes to fit piping (Brand may very)",
       "image": "assets/images/HoleSaw(NoBit).jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "Metal Reciprocating Saw Bit",
@@ -8184,6 +11938,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Bit designed for cutting metal on a reciprocating saw (Brand may very)",
       "image": "assets/images/MetalSawzallBlade.jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "Wood Reciprocating Saw Bit",
@@ -8192,6 +11947,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           "Bit designed for cutting wood on a reciprocating saw (Brand may very)",
       "image": "assets/images/WoodSawzallBlade.jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
     {
       "name": "Pipe Wrench (14 in.)",
@@ -8199,6 +11955,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "Heavy-duty wrench for gripping pipes (Brand may very)",
       "image": "assets/images/PipeWrench.jpg",
       "categories": ["Tools"],
+      "specialtyStoreTag": "plumbingTools",
     },
   ];
 
@@ -8273,6 +12030,8 @@ class _PlumbingScreenState extends State<PlumbingScreen>
             "price": item.price,
             "image": item.image,
             "quantity": item.quantity,
+            "specialtyStoreTag": item.specialtyStoreTag,
+            requiresCarDeliveryKey: item.requiresCarDelivery,
           }),
         )
         .toList();
@@ -8293,6 +12052,8 @@ class _PlumbingScreenState extends State<PlumbingScreen>
             price: decoded["price"],
             image: decoded["image"],
             description: decoded["description"] ?? "",
+            specialtyStoreTag: decoded["specialtyStoreTag"],
+            requiresCarDelivery: decoded[requiresCarDeliveryKey] == true,
             quantity: decoded["quantity"] ?? 1,
           );
         }).toList();
@@ -8315,7 +12076,10 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       // 🔁 Increase quantity
       final currentQty = doc["quantity"] ?? 1;
 
-      await docRef.update({"quantity": currentQty + qty});
+      await docRef.update({
+        "quantity": currentQty + qty,
+        requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
+      });
     } else {
       // ➕ New item
       await docRef.set({
@@ -8324,6 +12088,8 @@ class _PlumbingScreenState extends State<PlumbingScreen>
         "image": item["image"],
         "description": item["description"],
         "quantity": qty,
+        "specialtyStoreTag": item["specialtyStoreTag"],
+        requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
       });
     }
 
@@ -8474,7 +12240,10 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           IconButton(
             icon: Icon(Icons.notifications),
             onPressed: () {
-              // 🔔 does nothing for now
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => NotificationsScreen()),
+              );
             },
           ),
           Stack(
