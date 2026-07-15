@@ -6,8 +6,64 @@ class HVACScreen extends StatefulWidget {
 }
 
 class _HVACScreenState extends State<HVACScreen> {
+  final ScrollController _partsScrollController = ScrollController();
   String selectedCategory = "All";
   String searchQuery = "";
+
+  Future<void> addHVACItem(Map<String, dynamic> item, int quantity) async {
+    await addTradeItemToCart(item, tradeType: "HVAC", quantity: quantity);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          duration: Duration(seconds: 2),
+          content: Text("Added to HVAC cart"),
+        ),
+      );
+  }
+
+  Future<void> openHVACCart() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final snapshot = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .collection('cart')
+        .get();
+
+    final cartItems = snapshot.docs.map((doc) {
+      final data = doc.data();
+      return CartItem(
+        itemId:
+            data["itemId"]?.toString() ??
+            catalogItemIdForTrade("HVAC", data["name"]?.toString() ?? ""),
+        name: data["name"],
+        price: (data["price"] as num).toDouble(),
+        image: data["image"],
+        description: data["description"] ?? "",
+        specialtyStoreTag: data["specialtyStoreTag"],
+        requiresCarDelivery: data[requiresCarDeliveryKey] == true,
+        quantity: (data["quantity"] ?? 1) as int,
+      );
+    }).toList();
+
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CartScreen(
+          cart: cartItems,
+          tradeType: "HVAC",
+          onUpdate: () {},
+          orders: [],
+          onSaveOrders: () {},
+        ),
+      ),
+    );
+  }
 
   final List<String> categories = [
     "All",
@@ -20,6 +76,12 @@ class _HVACScreenState extends State<HVACScreen> {
     "Refrigerant",
     "Specialty",
   ];
+
+  @override
+  void dispose() {
+    _partsScrollController.dispose();
+    super.dispose();
+  }
 
   final List<Map<String, dynamic>> parts = [
     {
@@ -202,7 +264,7 @@ class _HVACScreenState extends State<HVACScreen> {
       "price": 35.00,
       "description":
           "Rods used for brazing copper to brass/steel/stainless steel (Brand may vary)",
-      "image": "assets/images/BrazingRods.jpg",
+      "image": "assets/images/SilverBrazingRods.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
@@ -234,56 +296,56 @@ class _HVACScreenState extends State<HVACScreen> {
       "price": 170.00,
       "description":
           "Tool used to make flare on pipe to fasten nut to threaded fitting (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
+      "image": "assets/images/CopperPipeBender.jpg",
       "categories": ["HVAC Service", "Brazing"],
     },
     {
-      "name": "208/230V to 24V 75VA Transformer",
+      "name": "208/240V AC to 24V AC 75VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 208/240V to 24V (Brand may vary)",
+      "image": "assets/images/240VACto24VAC(75VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
-      "name": "208/230V to 24V 50VA Transformer",
+      "name": "208/240V AC to 24V AC 50VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 208/240V to 24V (Brand may vary)",
+      "image": "assets/images/240VACto24VAC(50VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
-      "name": "208/230V to 24V 40VA Transformer",
+      "name": "208/240V AC to 24V AC 40VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 208/240V to 24V (Brand may vary)",
+      "image": "assets/images/240VACto24VAC(40VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
-      "name": "120V to 24V 75VA Transformer",
+      "name": "120V to 24V AC 75VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 120V to 24V (Brand may vary)",
+      "image": "assets/images/120VACto24VAC(75VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
-      "name": "120V to 24V 50VA Transformer",
+      "name": "120V AC to 24V AC 50VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 120V to 24V (Brand may vary)",
+      "image": "assets/images/120VACto24VAC(50VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
-      "name": "120V to 24V 40VA Transformer",
+      "name": "120V AC to 24V AC 40VA Transformer",
       "price": 170.00,
       "description":
-          "Transformer used to step down from 208/230V to 24V (Brand may vary)",
-      "image": "assets/images/FlaringTool.jpg",
-      "categories": ["HVAC Service", "Brazing"],
+          "Transformer used to step down from 120V to 24V (Brand may vary)",
+      "image": "assets/images/120VACto24VAC(40VA).jpg",
+      "categories": ["HVAC Service", "Transformers"],
     },
     {
       "name": "Residential Hermetic AC Compressor",
@@ -407,7 +469,14 @@ class _HVACScreenState extends State<HVACScreen> {
       "categories": ["Refrigerant"],
     },
     {
-      "name": "1/4 in. Access Tee With Schrader Valve",
+      "name": "1/4 in. Valve Core Removal Fitting",
+      "price": 12.00,
+      "description": "Service access tee for refrigerant line service work.",
+      "image": "assets/images/hvac_access_tee.jpg",
+      "categories": ["Refrigerant"],
+    },
+    {
+      "name": "5/16 in. Valve Core Removal Fitting",
       "price": 12.00,
       "description": "Service access tee for refrigerant line service work.",
       "image": "assets/images/hvac_access_tee.jpg",
@@ -454,7 +523,8 @@ class _HVACScreenState extends State<HVACScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final filteredParts = parts.where((item) {
+    final catalogParts = hvacCatalogParts.isNotEmpty ? hvacCatalogParts : parts;
+    final filteredParts = catalogParts.where((item) {
       final matchesSearch = item["name"].toLowerCase().contains(
         searchQuery.toLowerCase(),
       );
@@ -484,6 +554,59 @@ class _HVACScreenState extends State<HVACScreen> {
         ),
         centerTitle: false,
         titleSpacing: 0,
+        actions: [
+          Stack(
+            children: [
+              IconButton(
+                tooltip: "Cart",
+                onPressed: openHVACCart,
+                icon: Icon(Icons.shopping_cart),
+              ),
+              StreamBuilder<QuerySnapshot>(
+                stream: FirebaseAuth.instance.currentUser == null
+                    ? null
+                    : FirebaseFirestore.instance
+                          .collection('users')
+                          .doc(FirebaseAuth.instance.currentUser!.uid)
+                          .collection('cart')
+                          .snapshots(),
+                builder: (context, snapshot) {
+                  if (!snapshot.hasData) return SizedBox.shrink();
+
+                  final total = snapshot.data!.docs.fold<int>(
+                    0,
+                    (sum, doc) =>
+                        sum +
+                        (((doc.data() as Map<String, dynamic>)["quantity"] ?? 0)
+                            as int),
+                  );
+
+                  if (total == 0) return SizedBox.shrink();
+
+                  return Positioned(
+                    right: 4,
+                    top: 4,
+                    child: Container(
+                      padding: EdgeInsets.all(4),
+                      decoration: BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Text(
+                        "$total",
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ],
       ),
 
       body: Column(
@@ -548,100 +671,108 @@ class _HVACScreenState extends State<HVACScreen> {
                       style: TextStyle(color: Colors.grey),
                     ),
                   )
-                : GridView.builder(
-                    padding: EdgeInsets.all(10),
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      childAspectRatio: 0.75,
-                      crossAxisSpacing: 10,
-                      mainAxisSpacing: 10,
-                    ),
-                    itemCount: filteredParts.length,
-                    itemBuilder: (context, index) {
-                      final item = filteredParts[index];
-                      final bool isSpecialty = item["isSpecialty"] == true;
+                : PartsScrollRail(
+                    controller: _partsScrollController,
+                    child: GridView.builder(
+                      controller: _partsScrollController,
+                      padding: EdgeInsets.fromLTRB(10, 10, 34, 10),
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 2,
+                        childAspectRatio: 0.75,
+                        crossAxisSpacing: 10,
+                        mainAxisSpacing: 10,
+                      ),
+                      itemCount: filteredParts.length,
+                      itemBuilder: (context, index) {
+                        final item = filteredParts[index];
+                        final bool isSpecialty = item["isSpecialty"] == true;
 
-                      return GestureDetector(
-                        onTap: () {
-                          if (isSpecialty) {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) =>
-                                    HVACSpecialtyDetailScreen(item: item),
-                              ),
-                            );
-                          } else {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) => DetailScreen(
-                                  name: item["name"],
-                                  price: item["price"],
-                                  description: item["description"],
-                                  image: item["image"],
-                                  onAdd: (qty) {
-                                    // Cart support can be wired in next.
-                                  },
-                                ),
-                              ),
-                            );
-                          }
-                        },
-                        child: Card(
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Column(
-                            children: [
-                              Expanded(child: partImage(item["image"])),
-                              Padding(
-                                padding: EdgeInsets.all(8),
-                                child: Column(
-                                  children: [
-                                    if (isSpecialty)
-                                      Container(
-                                        margin: EdgeInsets.only(bottom: 6),
-                                        padding: EdgeInsets.symmetric(
-                                          horizontal: 8,
-                                          vertical: 4,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: Colors.orange.shade100,
-                                          borderRadius: BorderRadius.circular(
-                                            20,
-                                          ),
-                                          border: Border.all(
-                                            color: Colors.orange.shade700,
-                                          ),
-                                        ),
-                                        child: Text(
-                                          "Specialty Item",
-                                          style: TextStyle(
-                                            color: Colors.orange.shade800,
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
+                        return GestureDetector(
+                          onTap: () {
+                            if (isSpecialty) {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (context) =>
+                                      HVACSpecialtyDetailScreen(
+                                        item: item,
+                                        onAdd: (quantity) =>
+                                            addHVACItem(item, quantity),
                                       ),
-                                    Text(
-                                      item["name"],
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      textAlign: TextAlign.center,
-                                    ),
-                                  ],
                                 ),
-                              ),
-                              Text(
-                                "\$${(item["price"] as num).toDouble().toStringAsFixed(2)}",
-                              ),
-                              SizedBox(height: 8),
-                            ],
+                              );
+                            } else {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (context) => DetailScreen(
+                                    name: item["name"],
+                                    price: item["price"],
+                                    description: item["description"],
+                                    image: item["image"],
+                                    onAdd: (qty) {
+                                      addHVACItem(item, qty);
+                                    },
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                          child: Card(
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Column(
+                              children: [
+                                Expanded(child: partImage(item["image"])),
+                                Padding(
+                                  padding: EdgeInsets.all(8),
+                                  child: Column(
+                                    children: [
+                                      if (isSpecialty)
+                                        Container(
+                                          margin: EdgeInsets.only(bottom: 6),
+                                          padding: EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 4,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: Colors.orange.shade100,
+                                            borderRadius: BorderRadius.circular(
+                                              20,
+                                            ),
+                                            border: Border.all(
+                                              color: Colors.orange.shade700,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            "Specialty Item",
+                                            style: TextStyle(
+                                              color: Colors.orange.shade800,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                      Text(
+                                        item["name"],
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Text(
+                                  "\$${(item["price"] as num).toDouble().toStringAsFixed(2)}",
+                                ),
+                                SizedBox(height: 8),
+                              ],
+                            ),
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
+                    ),
                   ),
           ),
         ],
@@ -652,8 +783,9 @@ class _HVACScreenState extends State<HVACScreen> {
 
 class HVACSpecialtyDetailScreen extends StatefulWidget {
   final Map<String, dynamic> item;
+  final ValueChanged<int> onAdd;
 
-  HVACSpecialtyDetailScreen({required this.item});
+  HVACSpecialtyDetailScreen({required this.item, required this.onAdd});
 
   @override
   State<HVACSpecialtyDetailScreen> createState() =>
@@ -809,10 +941,12 @@ class _HVACSpecialtyDetailScreenState extends State<HVACSpecialtyDetailScreen> {
           ),
           SizedBox(height: 20),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final specSummary = selectedSpecs.entries
                   .map((entry) => "${entry.key}: ${entry.value}")
                   .join(", ");
+
+              widget.onAdd(quantity);
 
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(

@@ -1,0 +1,50 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function orderExists(orderId) {
+      return firestore.exists(/databases/(default)/documents/orders/$(orderId));
+    }
+
+    function order(orderId) {
+      return firestore.get(/databases/(default)/documents/orders/$(orderId)).data;
+    }
+
+    function canReadOrderProof(orderId) {
+      return signedIn()
+        && orderExists(orderId)
+        && (
+          order(orderId).userId == request.auth.uid
+          || order(orderId).driverId == request.auth.uid
+          || order(orderId).storeId == request.auth.uid
+          || (
+            order(orderId).eligibleDrivers is list
+            && request.auth.uid in order(orderId).eligibleDrivers
+          )
+        );
+    }
+
+    function canUploadPickupProof(orderId, fileName) {
+      return signedIn()
+        && orderExists(orderId)
+        && order(orderId).driverId == request.auth.uid
+        && order(orderId).status == 'Picked Up'
+        && fileName.matches('^[0-9]+\\.jpg$')
+        && request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType == 'image/jpeg'
+        && request.resource.metadata.orderId == orderId
+        && request.resource.metadata.driverId == request.auth.uid
+        && request.resource.metadata.proofType == 'item_or_receipt';
+    }
+
+    match /pickup_proofs/{orderId}/{fileName} {
+      allow read: if canReadOrderProof(orderId);
+      allow create: if canUploadPickupProof(orderId, fileName);
+      allow update, delete: if false;
+    }
+  }
+}

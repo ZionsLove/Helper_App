@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Customers and drivers use the camera for delivery proof, receipts, and order support photos.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Customers and drivers can choose photos for delivery proof, receipts, and order support.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -1,0 +1,142 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function onlyChanged(keys) {
+      return changedKeys().hasOnly(keys);
+    }
+
+    function orderParticipantsCanRead() {
+      return signedIn()
+        && (
+          resource.data.userId == request.auth.uid
+          || resource.data.driverId == request.auth.uid
+          || resource.data.storeId == request.auth.uid
+          || (
+            resource.data.eligibleDrivers is list
+            && request.auth.uid in resource.data.eligibleDrivers
+          )
+        );
+    }
+
+    function validPickupProofUpdate(orderId) {
+      return signedIn()
+        && resource.data.driverId == request.auth.uid
+        && resource.data.status == 'Picked Up'
+        && onlyChanged([
+          'pickupProofPhotoUrl',
+          'pickupProofPhotoPath',
+          'pickupProofUploadedAt',
+          'pickupProofUploadedBy'
+        ])
+        && request.resource.data.pickupProofUploadedBy == request.auth.uid
+        && request.resource.data.pickupProofPhotoUrl is string
+        && request.resource.data.pickupProofPhotoUrl.size() > 0
+        && request.resource.data.pickupProofPhotoPath is string
+        && request.resource.data.pickupProofPhotoPath.matches(
+          '^pickup_proofs/' + orderId + '/[^/]+$'
+        );
+    }
+
+    function protectedUserKeys() {
+      return [
+        'stripeCustomerId',
+        'stripeAccountId',
+        'earnings',
+        'careerEarnings',
+        'availableBalance',
+        'withdrawnBalance'
+      ];
+    }
+
+    function protectedDriverKeys() {
+      return [
+        'activeOrderAcceptedAt',
+        'activeOrderId',
+        'availableBalance',
+        'careerEarnings',
+        'earnings',
+        'isBusy',
+        'lastWithdrawalAt',
+        'stripeAccountId',
+        'stripeAccountLast4',
+        'stripeAccountStatus',
+        'withdrawnBalance'
+      ];
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && !request.resource.data.keys().hasAny(protectedUserKeys());
+      allow update: if isOwner(userId)
+        && !changedKeys().hasAny(protectedUserKeys());
+      allow delete: if false;
+
+      match /cart/{cartItemId} {
+        allow read, create, update, delete: if isOwner(userId);
+      }
+
+      match /{document=**} {
+        allow read, create, update, delete: if isOwner(userId);
+      }
+    }
+
+    match /drivers/{driverId} {
+      // Customers need to read assigned driver location during tracking.
+      // Move public driver tracking data to a separate collection before tightening this read further.
+      allow read: if signedIn();
+
+      allow create: if isOwner(driverId)
+        && !request.resource.data.keys().hasAny([
+          'activeOrderAcceptedAt',
+          'activeOrderId',
+          'availableBalance',
+          'careerEarnings',
+          'earnings',
+          'lastWithdrawalAt',
+          'stripeAccountId',
+          'stripeAccountLast4',
+          'stripeAccountStatus',
+          'withdrawnBalance'
+        ])
+        && (
+          !('isBusy' in request.resource.data)
+          || request.resource.data.isBusy == false
+        );
+      allow update: if isOwner(driverId)
+        && !changedKeys().hasAny(protectedDriverKeys());
+      allow delete: if false;
+
+      match /availableOrders/{orderId} {
+        allow read: if isOwner(driverId);
+        allow create, update, delete: if false;
+      }
+    }
+
+    match /orders/{orderId} {
+      allow read: if orderParticipantsCanRead();
+
+      // Orders and status changes are owned by Cloud Functions.
+      allow create: if false;
+      allow update: if validPickupProofUpdate(orderId);
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

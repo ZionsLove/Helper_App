@@ -1,25 +1,29 @@
-import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:math';
 import 'package:firebase_core/firebase_core.dart';
 import 'firebase_options.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'confirm_location_screen.dart';
 import 'driver_onboarding_screen.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter_stripe/flutter_stripe.dart' as stripe;
+import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart' as app_permissions;
 
 import 'package:url_launcher/url_launcher.dart';
 
 part 'HVACScreen.dart';
+part 'catalog_items.dart';
 //com.example.apprentice_app
 //C7:C8:50:2F:DD:1F:8A:51:43:7A:58:00:E0:57:E4:F8:73:00:77:61
 
@@ -28,7 +32,162 @@ part 'HVACScreen.dart';
 const double minDeliveryFee = 17.0;
 const double taxRate = 0.08875;
 const String requiresCarDeliveryKey = "requiresCarDelivery";
+const String customerTermsVersion = "2026-07-03";
+const String privacyPolicyVersion = "2026-07-03";
+const String customerTermsUrl = "https://thehelpersapp.com/terms";
+const String privacyPolicyUrl = "https://thehelpersapp.com/privacy-policy";
+const String returnRefundPolicyUrl =
+    "https://thehelpersapp.com/return-refund-policy";
 const Set<String> motorVehicleTypes = {"car", "pickup_truck_van"};
+const Set<String> ownerAdminEmails = {"chrisl2000@thehelpersapp.com"};
+
+bool isOwnerAdminEmail(String? email) {
+  return email != null && ownerAdminEmails.contains(email.toLowerCase());
+}
+
+String generateCustomerDeliveryPin() {
+  final random = Random.secure();
+  return (1000 + random.nextInt(9000)).toString();
+}
+
+Future<String> ensureCustomerDeliveryPin(String userId) async {
+  final userRef = FirebaseFirestore.instance.collection('users').doc(userId);
+  final userDoc = await userRef.get();
+  final existingPin = userDoc.data()?["deliveryPin"]?.toString();
+
+  if (existingPin != null && RegExp(r'^\d{4}$').hasMatch(existingPin)) {
+    return existingPin;
+  }
+
+  final newPin = generateCustomerDeliveryPin();
+  await userRef.set({
+    "deliveryPin": newPin,
+    "deliveryPinUpdatedAt": FieldValue.serverTimestamp(),
+  }, SetOptions(merge: true));
+  return newPin;
+}
+
+BoxDecoration appScreenFadeDecoration() {
+  return BoxDecoration(
+    gradient: LinearGradient(
+      begin: Alignment.bottomCenter,
+      end: Alignment.topCenter,
+      colors: [Colors.grey.shade300, Colors.grey.shade50],
+      stops: [0.0, 0.55],
+    ),
+  );
+}
+
+Widget appScreenFade({required Widget child}) {
+  return Container(
+    width: double.infinity,
+    height: double.infinity,
+    decoration: appScreenFadeDecoration(),
+    child: child,
+  );
+}
+
+String cartItemDocId(String itemName) {
+  return itemName.replaceAll("/", "_slash_");
+}
+
+String catalogSlug(String value) {
+  final slug = value
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+      .replaceAll(RegExp(r'^-+|-+$'), '');
+
+  return slug.isEmpty ? 'item' : slug;
+}
+
+String catalogItemIdForTrade(String tradeType, String itemName) {
+  return "${tradeType.toLowerCase()}:${catalogSlug(itemName)}";
+}
+
+Future<void> addTradeItemToCart(
+  Map<String, dynamic> item, {
+  required String tradeType,
+  int quantity = 1,
+}) async {
+  final user = FirebaseAuth.instance.currentUser;
+  if (user == null) return;
+
+  final itemName = item["name"]?.toString() ?? "";
+  final itemId =
+      item["itemId"]?.toString() ?? catalogItemIdForTrade(tradeType, itemName);
+
+  final cartRef = FirebaseFirestore.instance
+      .collection('users')
+      .doc(user.uid)
+      .collection('cart');
+  final docRef = cartRef.doc(cartItemDocId(itemId));
+  final doc = await docRef.get();
+
+  if (doc.exists) {
+    final currentQuantity = (doc.data()?["quantity"] ?? 1) as int;
+    await docRef.update({
+      "itemId": itemId,
+      "quantity": currentQuantity + quantity,
+      "tradeType": tradeType,
+      requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
+    });
+    return;
+  }
+
+  final legacyDocRef = cartRef.doc(cartItemDocId(itemName));
+  if (legacyDocRef.path != docRef.path) {
+    final legacyDoc = await legacyDocRef.get();
+
+    if (legacyDoc.exists) {
+      final currentQuantity = (legacyDoc.data()?["quantity"] ?? 1) as int;
+      await legacyDocRef.update({
+        "itemId": itemId,
+        "quantity": currentQuantity + quantity,
+        "tradeType": tradeType,
+        requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
+      });
+      return;
+    }
+  }
+
+  await docRef.set({
+    "itemId": itemId,
+    "name": itemName,
+    "price": item["price"],
+    "image": item["image"],
+    "description": item["description"],
+    "quantity": quantity,
+    "tradeType": tradeType,
+    "specialtyStoreTag": item["specialtyStoreTag"],
+    requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
+  });
+}
+
+class PartsScrollRail extends StatelessWidget {
+  final ScrollController controller;
+  final Widget child;
+
+  const PartsScrollRail({
+    super.key,
+    required this.controller,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(right: 8),
+      child: Scrollbar(
+        controller: controller,
+        thumbVisibility: true,
+        thickness: 16,
+        radius: Radius.circular(14),
+        interactive: true,
+        child: child,
+      ),
+    );
+  }
+}
 
 Future<Position?> requestLocation() async {
   bool serviceEnabled;
@@ -114,7 +273,7 @@ void main() async {
   // 🔥 STEP 1 — ADD YOUR PUBLISHABLE KEY HERE
   if (!kIsWeb) {
     stripe.Stripe.publishableKey =
-        "pk_test_51TQWNvROBLc14B5hkhpybYHZ2wQSL6MjKJynFQsRkl1fsMMCniENxjgz3ZNTkTR3ByhTXoUzau9EI56QWEiPsxoW00LrgMgzp4";
+        "pk_live_51TQWNoEn8pLIEIC790W7UTfUJaW26vD8qrwfniHNzcTmwERVL4ZqGJAqjiSwW7UyCya8f5og0eGLk81vBJkndIAf00xpM60p8S";
   }
 
   await PushNotificationService.setup();
@@ -170,7 +329,14 @@ class PushNotificationService {
     final data = userDoc.data();
 
     if (data?['role'] == 'driver') {
-      await FirebaseFirestore.instance.collection('drivers').doc(userId).set({
+      final driverRef = FirebaseFirestore.instance
+          .collection('drivers')
+          .doc(userId);
+      final driverDoc = await driverRef.get();
+
+      if (!driverDoc.exists) return;
+
+      await driverRef.set({
         'fcmToken': token,
         'fcmTokens': FieldValue.arrayUnion([token]),
       }, SetOptions(merge: true));
@@ -245,6 +411,7 @@ class MyApp extends StatelessWidget {
 }
 
 class CartItem {
+  final String? itemId;
   final String name;
   final double price;
   final String image;
@@ -254,6 +421,7 @@ class CartItem {
   int quantity;
 
   CartItem({
+    this.itemId,
     required this.name,
     required this.price,
     required this.image,
@@ -265,6 +433,7 @@ class CartItem {
 
   Map<String, dynamic> toJson() {
     return {
+      'itemId': itemId,
       'name': name,
       'price': price,
       'image': image,
@@ -297,6 +466,7 @@ class Order {
     return {
       "items": items.map((item) {
         return {
+          "itemId": item.itemId,
           "name": item.name,
           "price": item.price,
           "image": item.image,
@@ -316,6 +486,7 @@ class Order {
     return Order(
       items: (json["items"] as List).map((item) {
         return CartItem(
+          itemId: item["itemId"],
           name: item["name"],
           price: item["price"],
           image: item["image"],
@@ -502,89 +673,91 @@ class _SearchScreenState extends State<SearchScreen> {
           },
         ),
       ),
-      body: Stack(
-        children: [
-          Column(
-            children: [
-              Divider(height: 1, thickness: 1.2, color: Colors.grey[400]),
+      body: appScreenFade(
+        child: Stack(
+          children: [
+            Column(
+              children: [
+                Divider(height: 1, thickness: 1.2, color: Colors.grey[400]),
 
-              Expanded(
-                child: ListView.separated(
-                  itemCount: results.length,
-                  separatorBuilder: (context, index) => Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 10),
-                    child: Divider(
-                      height: 1,
-                      thickness: 0.5,
-                      color: Colors.grey[300],
+                Expanded(
+                  child: ListView.separated(
+                    itemCount: results.length,
+                    separatorBuilder: (context, index) => Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 10),
+                      child: Divider(
+                        height: 1,
+                        thickness: 0.5,
+                        color: Colors.grey[300],
+                      ),
                     ),
-                  ),
-                  itemBuilder: (context, index) {
-                    return ListTile(
-                      leading: Image.asset(
-                        results[index]["image"],
-                        width: 50,
-                        height: 50,
-                        fit: BoxFit.cover,
-                      ),
-                      title: Text(results[index]["name"]),
-                      subtitle: Text(
-                        "\$${(results[index]["price"] as num).toDouble().toStringAsFixed(2)}",
-                      ),
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) => DetailScreen(
-                              name: results[index]["name"],
-                              price: results[index]["price"],
-                              description:
-                                  results[index]["description"], // ✅ comma
-                              image: results[index]["image"],
-                              onAdd: (qty) {
-                                widget.addToCart(results[index], qty);
-                                showAddedToCartMessage();
-                              },
+                    itemBuilder: (context, index) {
+                      return ListTile(
+                        leading: Image.asset(
+                          results[index]["image"],
+                          width: 50,
+                          height: 50,
+                          fit: BoxFit.cover,
+                        ),
+                        title: Text(results[index]["name"]),
+                        subtitle: Text(
+                          "\$${(results[index]["price"] as num).toDouble().toStringAsFixed(2)}",
+                        ),
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (context) => DetailScreen(
+                                name: results[index]["name"],
+                                price: results[index]["price"],
+                                description:
+                                    results[index]["description"], // ✅ comma
+                                image: results[index]["image"],
+                                onAdd: (qty) {
+                                  widget.addToCart(results[index], qty);
+                                  showAddedToCartMessage();
+                                },
+                              ),
                             ),
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-          Positioned(
-            bottom: 50,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: AnimatedOpacity(
-                duration: Duration(milliseconds: 500),
-                opacity: showAddedMessage ? 1.0 : 0.0,
-                child: Container(
-                  padding: EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                  decoration: BoxDecoration(
-                    color: Colors.green,
-                    borderRadius: BorderRadius.circular(20),
+                          );
+                        },
+                      );
+                    },
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.check, color: Colors.white),
-                      SizedBox(width: 8),
-                      Text(
-                        "Added to cart",
-                        style: TextStyle(color: Colors.white),
-                      ),
-                    ],
+                ),
+              ],
+            ),
+            Positioned(
+              bottom: 50,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: AnimatedOpacity(
+                  duration: Duration(milliseconds: 500),
+                  opacity: showAddedMessage ? 1.0 : 0.0,
+                  child: Container(
+                    padding: EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.green,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.check, color: Colors.white),
+                        SizedBox(width: 8),
+                        Text(
+                          "Added to cart",
+                          style: TextStyle(color: Colors.white),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
       resizeToAvoidBottomInset: true,
     );
@@ -592,6 +765,12 @@ class _SearchScreenState extends State<SearchScreen> {
 }
 
 class _CartScreenState extends State<CartScreen> {
+  void showEmptyCartMessage() {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text("Add items before checkout.")));
+  }
+
   @override
   Widget build(BuildContext context) {
     double total = 0;
@@ -627,12 +806,13 @@ class _CartScreenState extends State<CartScreen> {
                   return ListView.builder(
                     itemCount: items.length,
                     itemBuilder: (context, index) {
+                      final cartDoc = items[index];
                       final data = items[index].data() as Map<String, dynamic>;
 
                       final qty = data["quantity"] ?? 1;
 
                       return ListTile(
-                        key: ValueKey(data["name"]),
+                        key: ValueKey(cartDoc.id),
                         title: Text(data["name"]),
                         subtitle: Text(
                           "\$${(data["price"] as num).toDouble().toStringAsFixed(2)} x $qty",
@@ -645,16 +825,12 @@ class _CartScreenState extends State<CartScreen> {
                             IconButton(
                               icon: Icon(Icons.remove),
                               onPressed: () async {
-                                final docRef = FirebaseFirestore.instance
-                                    .collection('users')
-                                    .doc(FirebaseAuth.instance.currentUser!.uid)
-                                    .collection('cart')
-                                    .doc(data["name"]);
-
                                 if (qty <= 1) {
-                                  await docRef.delete();
+                                  await cartDoc.reference.delete();
                                 } else {
-                                  await docRef.update({"quantity": qty - 1});
+                                  await cartDoc.reference.update({
+                                    "quantity": qty - 1,
+                                  });
                                 }
                               },
                             ),
@@ -665,13 +841,9 @@ class _CartScreenState extends State<CartScreen> {
                             IconButton(
                               icon: Icon(Icons.add),
                               onPressed: () async {
-                                final docRef = FirebaseFirestore.instance
-                                    .collection('users')
-                                    .doc(FirebaseAuth.instance.currentUser!.uid)
-                                    .collection('cart')
-                                    .doc(data["name"]);
-
-                                await docRef.update({"quantity": qty + 1});
+                                await cartDoc.reference.update({
+                                  "quantity": qty + 1,
+                                });
                               },
                             ),
                           ],
@@ -707,15 +879,32 @@ class _CartScreenState extends State<CartScreen> {
 
             SizedBox(height: 20),
 
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                minimumSize: Size(double.infinity, 50),
-                backgroundColor: Colors.green,
-              ),
-              onPressed: () {
-                showCheckoutModal(context);
+            StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(FirebaseAuth.instance.currentUser!.uid)
+                  .collection('cart')
+                  .snapshots(),
+              builder: (context, snapshot) {
+                final hasItems =
+                    snapshot.hasData && snapshot.data!.docs.isNotEmpty;
+
+                return ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    minimumSize: Size(double.infinity, 50),
+                    backgroundColor: hasItems ? Colors.green : Colors.grey,
+                  ),
+                  onPressed: () {
+                    if (!hasItems) {
+                      showEmptyCartMessage();
+                      return;
+                    }
+
+                    showCheckoutModal(context);
+                  },
+                  child: Text("Proceed to Checkout"),
+                );
               },
-              child: Text("Proceed to Checkout"),
             ),
           ],
         ),
@@ -725,12 +914,13 @@ class _CartScreenState extends State<CartScreen> {
 
   void showCheckoutModal(BuildContext context) {
     bool useSavedAddressLocal = true;
+    final cartContext = context;
 
     showModalBottomSheet(
       context: context,
-      builder: (context) {
+      builder: (sheetContext) {
         return StatefulBuilder(
-          builder: (context, setModalState) {
+          builder: (modalContext, setModalState) {
             return Padding(
               padding: EdgeInsets.all(16),
               child: Column(
@@ -758,7 +948,7 @@ class _CartScreenState extends State<CartScreen> {
 
                   ElevatedButton(
                     onPressed: () async {
-                      Navigator.pop(context);
+                      Navigator.pop(sheetContext);
 
                       final snapshot = await FirebaseFirestore.instance
                           .collection('users')
@@ -770,6 +960,12 @@ class _CartScreenState extends State<CartScreen> {
                         final data = doc.data();
 
                         return CartItem(
+                          itemId:
+                              data["itemId"]?.toString() ??
+                              catalogItemIdForTrade(
+                                widget.tradeType,
+                                data["name"]?.toString() ?? "",
+                              ),
                           name: data["name"],
                           price: (data["price"] as num).toDouble(),
                           image: data["image"],
@@ -781,8 +977,15 @@ class _CartScreenState extends State<CartScreen> {
                         );
                       }).toList();
 
+                      if (cartItems.isEmpty) {
+                        if (cartContext.mounted) {
+                          showEmptyCartMessage();
+                        }
+                        return;
+                      }
+
                       final result = await Navigator.push(
-                        context,
+                        cartContext,
                         MaterialPageRoute(
                           builder: (_) => CheckoutScreen(
                             cart: cartItems,
@@ -794,7 +997,14 @@ class _CartScreenState extends State<CartScreen> {
 
                       print("📦 RESULT FROM CHECKOUT: $result");
 
-                      if (result == "orderPlaced") {
+                      final orderPlaced =
+                          result == "orderPlaced" ||
+                          (result is Map && result["status"] == "orderPlaced");
+                      final placedOrderId = result is Map
+                          ? result["orderId"]?.toString()
+                          : null;
+
+                      if (orderPlaced) {
                         print("🧹 clearing Firestore cart");
 
                         final user = FirebaseAuth.instance.currentUser;
@@ -812,6 +1022,19 @@ class _CartScreenState extends State<CartScreen> {
                         }
 
                         await batch.commit();
+
+                        if (!cartContext.mounted) return;
+
+                        if (placedOrderId != null && placedOrderId.isNotEmpty) {
+                          Navigator.pushReplacement(
+                            cartContext,
+                            MaterialPageRoute(
+                              builder: (_) => CustomerOrderTrackingScreen(
+                                orderId: placedOrderId,
+                              ),
+                            ),
+                          );
+                        }
                       }
                     },
                     child: Text("Continue"),
@@ -853,10 +1076,16 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
   String? selectedPaymentMethodId;
   String? selectedLast4;
   String? selectedBrand;
+  late final Future<String?> deliveryPinFuture;
+  double selectedTip = 0.0;
 
   @override
   void initState() {
     super.initState();
+    final user = FirebaseAuth.instance.currentUser;
+    deliveryPinFuture = user == null
+        ? Future.value(null)
+        : ensureCustomerDeliveryPin(user.uid);
     loadPaymentMethod();
   }
 
@@ -968,6 +1197,116 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
         isLoadingPayment = false; // still stop loading
       });
     }
+  }
+
+  Future<void> chooseCustomTip() async {
+    final controller = TextEditingController(
+      text: selectedTip > 0 ? selectedTip.toStringAsFixed(2) : "",
+    );
+
+    final customTip = await showDialog<double>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Custom Tip"),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(
+              prefixText: "\$",
+              labelText: "Tip amount",
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final amount = double.tryParse(controller.text.trim());
+                Navigator.pop(
+                  context,
+                  amount == null || amount < 0 ? 0 : amount,
+                );
+              },
+              child: Text("Apply"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (customTip == null || !mounted) return;
+
+    setState(() {
+      selectedTip = customTip;
+    });
+  }
+
+  Widget tipButton(String label, double amount) {
+    final isSelected = selectedTip == amount;
+
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => selectedTip = amount),
+        child: AnimatedContainer(
+          duration: Duration(milliseconds: 180),
+          height: 42,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isSelected ? Colors.orange : Colors.white,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isSelected ? Colors.orange : Colors.orange.shade200,
+              width: 1.4,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? Colors.white : Colors.orange.shade900,
+              fontWeight: FontWeight.bold,
+              fontSize: 13,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget customTipButton() {
+    final isSelected =
+        selectedTip > 0 && !const [2.0, 3.0, 4.0, 5.0].contains(selectedTip);
+
+    return Expanded(
+      child: GestureDetector(
+        onTap: chooseCustomTip,
+        child: AnimatedContainer(
+          duration: Duration(milliseconds: 180),
+          height: 42,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isSelected ? Colors.orange : Colors.white,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isSelected ? Colors.orange : Colors.orange.shade200,
+              width: 1.4,
+            ),
+          ),
+          child: Text(
+            isSelected ? "\$${selectedTip.toStringAsFixed(2)}" : "Custom",
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: isSelected ? Colors.white : Colors.orange.shade900,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void showPaymentMethodSelector() {
@@ -2169,70 +2508,36 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       return manualStore;
     }
 
-    String keyword;
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'findClosestSupplyStore',
+      );
+      final result = await callable.call({
+        'latitude': position.latitude,
+        'longitude': position.longitude,
+        'tradeType': tradeType,
+      });
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final store = data['store'];
 
-    if (tradeType == "Plumbing") {
-      keyword = "plumbing supply store";
-    } else if (tradeType == "Electrical") {
-      keyword = "electrical supply store";
-    } else {
-      keyword = "hvac supply store";
-    }
-
-    final apiKey = "AIzaSyDSfFnud2nPQy9FHcJlqOBKDhbMrYrWP0E";
-
-    final url =
-        "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        "?location=${position.latitude},${position.longitude}"
-        "&rankby=distance"
-        "&keyword=$keyword"
-        "&key=$apiKey";
-
-    final response = await http.get(Uri.parse(url));
-
-    if (response.statusCode != 200) {
-      print("Places API failed");
-      return null;
-    }
-
-    final data = jsonDecode(response.body);
-
-    print("🌍 STORE SEARCH RESPONSE: ${response.body}");
-
-    if (data["results"] == null || data["results"].isEmpty) {
-      print("No trade stores found");
-      return null;
-    }
-
-    Map<String, dynamic>? fallbackStore;
-
-    for (final store in data["results"]) {
-      final isOpen = store["opening_hours"]?["open_now"] ?? false;
-
-      if (isOpen) {
-        return {
-          "id": store["place_id"],
-          "storeName": store["name"],
-          "lat": store["geometry"]["location"]["lat"],
-          "lng": store["geometry"]["location"]["lng"],
-          "address": store["vicinity"] ?? "",
-        };
+      if (store == null) {
+        print("No trade stores found");
+        return null;
       }
 
-      fallbackStore ??= store;
+      final storeData = Map<String, dynamic>.from(store as Map);
+      print(
+        "🌍 STORE SEARCH SELECTED: " +
+            (storeData["storeName"] ?? "Supply Store").toString(),
+      );
+      return storeData;
+    } on FirebaseFunctionsException catch (error) {
+      print("Places function failed: ${error.message}");
+      return null;
+    } catch (error) {
+      print("Places function failed: $error");
+      return null;
     }
-
-    if (fallbackStore != null) {
-      return {
-        "id": fallbackStore["place_id"],
-        "storeName": fallbackStore["name"],
-        "lat": fallbackStore["geometry"]["location"]["lat"],
-        "lng": fallbackStore["geometry"]["location"]["lng"],
-        "address": fallbackStore["vicinity"] ?? "",
-      };
-    }
-
-    return null;
   }
 
   Future<List<String>> findNearbyDrivers(
@@ -2294,12 +2599,13 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
       0.0,
       (sum, item) => sum + (item.price * item.quantity),
     );
+    final hasCartItems = widget.cart.isNotEmpty;
 
     double deliveryFee = minDeliveryFee;
 
     double tax = subtotal * taxRate;
 
-    double total = subtotal + deliveryFee + tax;
+    double total = subtotal + deliveryFee + tax + selectedTip;
 
     String formattedBrand = brand != null && brand!.isNotEmpty
         ? "${brand![0].toUpperCase()}${brand!.substring(1)}"
@@ -2352,6 +2658,9 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                         SizedBox(height: 4),
 
                         Text("Tax: \$${tax.toStringAsFixed(2)}"),
+                        SizedBox(height: 4),
+
+                        Text("Tip: \$${selectedTip.toStringAsFixed(2)}"),
                         SizedBox(height: 8),
 
                         Divider(),
@@ -2366,6 +2675,100 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                       ],
                     ),
                   ),
+
+                  Container(
+                    width: double.infinity,
+                    margin: EdgeInsets.only(top: 12),
+                    padding: EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[100],
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "Add a driver tip",
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14,
+                          ),
+                        ),
+                        SizedBox(height: 10),
+                        Row(
+                          children: [
+                            tipButton("\$2", 2),
+                            SizedBox(width: 8),
+                            tipButton("\$3", 3),
+                            SizedBox(width: 8),
+                            tipButton("\$4", 4),
+                            SizedBox(width: 8),
+                            tipButton("\$5", 5),
+                            SizedBox(width: 8),
+                            customTipButton(),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  FutureBuilder<String?>(
+                    future: deliveryPinFuture,
+                    builder: (context, snapshot) {
+                      final pin = snapshot.data;
+
+                      return Container(
+                        width: double.infinity,
+                        margin: EdgeInsets.only(top: 12),
+                        padding: EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.orange.shade200),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.pin, color: Colors.orange.shade800),
+                            SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    "Delivery PIN",
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.orange.shade900,
+                                    ),
+                                  ),
+                                  SizedBox(height: 3),
+                                  Text(
+                                    pin ?? "Loading...",
+                                    style: TextStyle(
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 5,
+                                    ),
+                                  ),
+                                  SizedBox(height: 3),
+                                  Text(
+                                    "Your driver must enter this before marking delivered.",
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.grey.shade700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+
+                  SizedBox(height: 12),
 
                   if (hasPaymentMethod && selectedLast4 != null)
                     GestureDetector(
@@ -2436,8 +2839,22 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
-                      onPressed: (hasPaymentMethod && !isPlacingOrder)
+                      onPressed:
+                          (hasPaymentMethod && !isPlacingOrder && hasCartItems)
                           ? () async {
+                              if (!hasCartItems) {
+                                ScaffoldMessenger.of(context)
+                                  ..hideCurrentSnackBar()
+                                  ..showSnackBar(
+                                    SnackBar(
+                                      content: Text(
+                                        "Add items before checkout.",
+                                      ),
+                                    ),
+                                  );
+                                return;
+                              }
+
                               setState(() {
                                 isPlacingOrder = true;
                               });
@@ -2531,99 +2948,58 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                   return;
                                 }
 
-                                final nearbyDrivers = await findNearbyDrivers(
-                                  (closestStore["lat"] as num).toDouble(),
-                                  (closestStore["lng"] as num).toDouble(),
-                                  requiresCarDelivery: cartRequiresCarDelivery(
-                                    widget.cart,
-                                  ),
-                                );
-
-                                print(
-                                  "🚗 Nearby Drivers Found: ${nearbyDrivers.length}",
-                                );
-
-                                if (nearbyDrivers.isEmpty) {
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    SnackBar(
-                                      content: Text(
-                                        "No nearby drivers available right now",
-                                      ),
-                                    ),
-                                  );
-                                  return;
-                                }
-
-                                double subtotal = widget.cart.fold(
-                                  0.0,
-                                  (sum, item) =>
-                                      sum + (item.price * item.quantity),
-                                );
-
-                                double deliveryFee = minDeliveryFee;
-                                double tax = subtotal * taxRate;
-                                double total = subtotal + deliveryFee + tax;
+                                double tip = selectedTip;
 
                                 final callable = FirebaseFunctions.instance
-                                    .httpsCallable('createPaymentIntent');
+                                    .httpsCallable('placeOrder');
 
-                                await callable.call({
-                                  "amount": (total * 100).toInt(),
+                                final orderResult = await callable.call({
                                   "paymentMethodId": selectedPaymentMethodId,
+                                  "customerLat": lat,
+                                  "customerLng": lng,
+                                  "customerAddress": address,
+                                  "customerName":
+                                      userData?['name'] ?? "Unknown",
+                                  "store": closestStore,
+                                  "tradeType": widget.tradeType,
+                                  "requiresCarDelivery":
+                                      cartRequiresCarDelivery(widget.cart),
+                                  "tip": tip,
+                                  "items": widget.cart
+                                      .map(
+                                        (item) => {
+                                          "itemId":
+                                              item.itemId ??
+                                              catalogItemIdForTrade(
+                                                widget.tradeType,
+                                                item.name,
+                                              ),
+                                          "quantity": item.quantity,
+                                        },
+                                      )
+                                      .toList(),
                                 });
+                                final orderData = Map<String, dynamic>.from(
+                                  orderResult.data as Map,
+                                );
+                                final orderId = orderData["orderId"]
+                                    ?.toString();
 
-                                print("💰 PAYMENT SUCCESS");
+                                if (orderId == null || orderId.isEmpty) {
+                                  throw StateError(
+                                    "Order was not confirmed by the server.",
+                                  );
+                                }
 
-                                // 🧾 SAVE ORDER
-                                final orderRef = await FirebaseFirestore
+                                print("💰 ORDER AND PAYMENT SUCCESS");
+
+                                final savedOrder = await FirebaseFirestore
                                     .instance
                                     .collection('orders')
-                                    .add({
-                                      "customerLat": lat,
-                                      "customerLng": lng,
-                                      "customerAddress": address,
-                                      "customerName":
-                                          userData?['name'] ?? "Unknown",
-                                      "date": DateTime.now().toIso8601String(),
-                                      "createdAt": FieldValue.serverTimestamp(),
-
-                                      "storeLat": closestStore["lat"],
-                                      "storeLng": closestStore["lng"],
-                                      "storeId": closestStore["id"],
-                                      "storeName":
-                                          closestStore["storeName"] ?? "Store",
-
-                                      "items": widget.cart
-                                          .map(
-                                            (item) => {
-                                              "name": item.name,
-                                              "price": item.price,
-                                              "image": item.image,
-                                              "quantity": item.quantity,
-                                              requiresCarDeliveryKey:
-                                                  item.requiresCarDelivery,
-                                            },
-                                          )
-                                          .toList(),
-
-                                      "subtotal": subtotal,
-                                      "deliveryFee": deliveryFee,
-                                      "tax": tax,
-                                      "total": total,
-
-                                      "status": "Pending",
-                                      "dispatchStatus": "queued",
-                                      "dispatchAttempts": 0,
-                                      "tradeType": widget.tradeType,
-                                      requiresCarDeliveryKey:
-                                          cartRequiresCarDelivery(widget.cart),
-                                      "eligibleDrivers": nearbyDrivers,
-                                      "userId": user.uid,
-                                    });
-
-                                final savedOrder = await orderRef.get(
-                                  const GetOptions(source: Source.server),
-                                );
+                                    .doc(orderId)
+                                    .get(
+                                      const GetOptions(source: Source.server),
+                                    );
 
                                 if (!savedOrder.exists) {
                                   throw StateError(
@@ -2634,13 +3010,33 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                 final result = await Navigator.push(
                                   context,
                                   MaterialPageRoute(
-                                    builder: (_) => OrderSuccessScreen(),
+                                    builder: (_) =>
+                                        OrderSuccessScreen(orderId: orderId),
                                   ),
                                 );
 
-                                if (result == "orderPlaced") {
-                                  Navigator.pop(context, "orderPlaced");
+                                if (result == "orderPlaced" ||
+                                    (result is Map &&
+                                        result["status"] == "orderPlaced")) {
+                                  Navigator.pop(context, {
+                                    "status": "orderPlaced",
+                                    "orderId": result is Map
+                                        ? result["orderId"]?.toString() ??
+                                              orderId
+                                        : orderId,
+                                  });
                                 }
+                              } on FirebaseFunctionsException catch (error) {
+                                print("❌ CHECKOUT FUNCTION ERROR: $error");
+
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      error.message ??
+                                          "Could not place order. Please try again.",
+                                    ),
+                                  ),
+                                );
                               } catch (e) {
                                 print("❌ ERROR: $e");
 
@@ -2650,9 +3046,11 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
                                   ),
                                 );
                               } finally {
-                                setState(() {
-                                  isPlacingOrder = false;
-                                });
+                                if (mounted) {
+                                  setState(() {
+                                    isPlacingOrder = false;
+                                  });
+                                }
                               }
                             }
                           : null,
@@ -2679,6 +3077,10 @@ class _CheckoutScreenState extends State<CheckoutScreen> {
 }
 
 class OrderSuccessScreen extends StatelessWidget {
+  final String orderId;
+
+  const OrderSuccessScreen({required this.orderId});
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2699,9 +3101,12 @@ class OrderSuccessScreen extends StatelessWidget {
 
             ElevatedButton(
               onPressed: () {
-                Navigator.pop(context, "orderPlaced");
+                Navigator.pop(context, {
+                  "status": "orderPlaced",
+                  "orderId": orderId,
+                });
               },
-              child: Text("Back to Home"),
+              child: Text("Track Order"),
             ),
           ],
         ),
@@ -2719,6 +3124,10 @@ class NotificationsScreen extends StatelessWidget {
         return Icons.inventory_2;
       case "Delivered":
         return Icons.done_all;
+      case "Store Issue":
+        return Icons.report_problem;
+      case "Customer Cancelled":
+        return Icons.cancel;
       case "Rejected":
         return Icons.cancel;
       default:
@@ -2734,6 +3143,10 @@ class NotificationsScreen extends StatelessWidget {
         return Colors.orange;
       case "Delivered":
         return Colors.green;
+      case "Store Issue":
+        return Colors.deepOrange;
+      case "Customer Cancelled":
+        return Colors.red;
       case "Rejected":
         return Colors.red;
       default:
@@ -2752,6 +3165,10 @@ class NotificationsScreen extends StatelessWidget {
         return "Your order was picked up from $storeName.";
       case "Delivered":
         return "Your order was delivered.";
+      case "Store Issue":
+        return "$storeName reported an item was not in stock. Choose whether to try the next nearest store.";
+      case "Customer Cancelled":
+        return "Your order was cancelled. The \$12 base delivery charge still applies.";
       case "Rejected":
         return "Your order could not be completed.";
       default:
@@ -2884,6 +3301,8 @@ class CustomerOrderTrackingScreen extends StatelessWidget {
         return Colors.orange;
       case "Delivered":
         return Colors.green;
+      case "Store Issue":
+        return Colors.deepOrange;
       case "Rejected":
         return Colors.red;
       default:
@@ -2892,6 +3311,14 @@ class CustomerOrderTrackingScreen extends StatelessWidget {
   }
 
   String trackingMessage(String status, bool hasDriver) {
+    if (status == "Store Issue") {
+      return "The store reported an item was not in stock. You can try sending this order to the next nearest store.";
+    }
+
+    if (status == "Customer Cancelled") {
+      return "This order was cancelled. The \$12 cancellation charge still applies.";
+    }
+
     if (!hasDriver) return "Waiting for a driver to accept this order.";
 
     switch (status) {
@@ -3114,6 +3541,88 @@ class CustomerOrderTrackingScreen extends StatelessWidget {
               trackingMessage(status, hasDriver),
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
+            if (status == "Store Issue") ...[
+              SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.deepOrange.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.deepOrange.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "Item not in stock",
+                      style: TextStyle(
+                        color: Colors.deepOrange.shade800,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      "Your order is paused. We can try the next nearest supply store without cancelling the order.",
+                      style: TextStyle(color: Colors.grey.shade800),
+                    ),
+                    SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        icon: Icon(Icons.storefront),
+                        label: Text("Try next nearest store"),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.deepOrange,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: () => retryAtNextStore(orderId),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.deepOrange.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.deepOrange.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "Cancel order",
+                      style: TextStyle(
+                        color: Colors.deepOrange.shade800,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      "If you cancel now, you agree that the \$12 base delivery charge still applies.",
+                      style: TextStyle(color: Colors.grey.shade800),
+                    ),
+                    SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        icon: Icon(Icons.cancel_outlined),
+                        label: Text("Cancel order"),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.deepOrange.shade800,
+                          side: BorderSide(color: Colors.deepOrange.shade400),
+                        ),
+                        onPressed: () => cancelStoreIssueOrder(orderId),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             SizedBox(height: 8),
             infoTile(
               Icons.store,
@@ -3246,6 +3755,122 @@ class CustomerOrderTrackingScreen extends StatelessWidget {
         Expanded(flex: 4, child: buildOrderPanel(order, driver)),
       ],
     );
+  }
+
+  Future<void> retryAtNextStore(String orderId) async {
+    final messenger = appNavigatorKey.currentContext == null
+        ? null
+        : ScaffoldMessenger.of(appNavigatorKey.currentContext!);
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'retryOrderAtNextStore',
+      );
+      final result = await callable.call({"orderId": orderId});
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final store = data["store"] is Map
+          ? Map<String, dynamic>.from(data["store"] as Map)
+          : <String, dynamic>{};
+      final storeName = store["storeName"] ?? "the next store";
+
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text("Order sent to $storeName.")));
+    } on FirebaseFunctionsException catch (error) {
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(error.message ?? "Could not find another store."),
+          ),
+        );
+    } catch (_) {
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text("Could not try another store right now.")),
+        );
+    }
+  }
+
+  Future<bool> confirmStoreIssueCancellation() async {
+    final context = appNavigatorKey.currentContext;
+    if (context == null) return false;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Cancel order?"),
+          content: Text(
+            "By cancelling this order, you agree that the \$12 base delivery charge still applies.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text("Keep Order"),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.deepOrange,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () => Navigator.pop(context, true),
+              child: Text("I Agree, Cancel"),
+            ),
+          ],
+        );
+      },
+    );
+
+    return confirmed == true;
+  }
+
+  Future<void> cancelStoreIssueOrder(String orderId) async {
+    final messenger = appNavigatorKey.currentContext == null
+        ? null
+        : ScaffoldMessenger.of(appNavigatorKey.currentContext!);
+
+    final confirmed = await confirmStoreIssueCancellation();
+    if (!confirmed) return;
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'cancelStoreIssueOrder',
+      );
+      final result = await callable.call({"orderId": orderId});
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final refundAmountCents = data["refundAmountCents"] is num
+          ? (data["refundAmountCents"] as num).toInt()
+          : 0;
+      final refundText = (refundAmountCents / 100).toStringAsFixed(2);
+
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              "Order cancelled. \$12 charge applies. Refunded \$$refundText.",
+            ),
+          ),
+        );
+    } on FirebaseFunctionsException catch (error) {
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              error.message ?? "Could not cancel order. Please try again.",
+            ),
+          ),
+        );
+    } catch (error) {
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text("Could not cancel order. Please try again.")),
+        );
+    }
   }
 
   @override
@@ -3514,47 +4139,80 @@ class AuthScreen extends StatefulWidget {
   _AuthScreenState createState() => _AuthScreenState();
 }
 
-class _AuthScreenState extends State<AuthScreen>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _fadeAnimation;
-  late Animation<Offset> _slideAnimation;
+class _AuthScreenState extends State<AuthScreen> {
   final emailController = TextEditingController();
   final passwordController = TextEditingController();
+  bool _didPrecacheBrandImages = false;
 
   bool isLogin = true;
   bool obscurePassword = true;
   bool isLoading = false;
+  bool acceptedCustomerTerms = false;
 
   String? errorMessage;
 
+  Future<void> openPolicyLink(String url) async {
+    final uri = Uri.parse(url);
+
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Could not open document link")));
+    }
+  }
+
+  Widget policyLink(String text, String url) {
+    return InkWell(
+      onTap: () => openPolicyLink(url),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: Colors.blue.shade700,
+          decoration: TextDecoration.underline,
+          decorationColor: Colors.blue.shade700,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
+  Widget helperBrand(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final wordmarkWidth = min(screenWidth * 0.76, 340.0);
+
+    return RepaintBoundary(
+      child: Image.asset(
+        "assets/images/HelperWordmark.png",
+        width: wordmarkWidth,
+        fit: BoxFit.contain,
+        filterQuality: FilterQuality.high,
+      ),
+    );
+  }
+
   @override
-  void initState() {
-    super.initState();
-
-    _controller = AnimationController(
-      vsync: this,
-      duration: Duration(milliseconds: 900), // smoother
-    );
-
-    _fadeAnimation = CurvedAnimation(
-      parent: _controller,
-      curve: Curves.easeOut, // smoother than easeIn
-    );
-
-    _slideAnimation = Tween<Offset>(
-      begin: Offset(0, 0.2), // start slightly lower
-      end: Offset.zero,
-    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOut));
-
-    _controller.forward();
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_didPrecacheBrandImages) return;
+    _didPrecacheBrandImages = true;
+    precacheImage(AssetImage("assets/images/HelperWordmark.png"), context);
   }
 
   Future<void> submit() async {
     FocusScope.of(context).unfocus();
 
+    if (!isLogin && !acceptedCustomerTerms) {
+      setState(() {
+        errorMessage =
+            "Please agree to the Terms, Privacy Policy, and Refund Policy";
+      });
+      return;
+    }
+
     setState(() {
       isLoading = true;
+      errorMessage = null;
     });
 
     try {
@@ -3582,6 +4240,53 @@ class _AuthScreenState extends State<AuthScreen>
                 password: passwordController.text.trim(),
               );
 
+          final user = credential.user;
+          if (user != null) {
+            final acceptedAt = FieldValue.serverTimestamp();
+            await FirebaseFirestore.instance
+                .collection("users")
+                .doc(user.uid)
+                .set({
+                  "email": user.email,
+                  "agreements": {
+                    "customerTerms": {
+                      "accepted": true,
+                      "version": customerTermsVersion,
+                      "url": customerTermsUrl,
+                      "acceptedAt": acceptedAt,
+                    },
+                    "privacyPolicy": {
+                      "accepted": true,
+                      "version": privacyPolicyVersion,
+                      "url": privacyPolicyUrl,
+                      "acceptedAt": acceptedAt,
+                    },
+                    "returnRefundPolicy": {
+                      "accepted": true,
+                      "version": customerTermsVersion,
+                      "url": returnRefundPolicyUrl,
+                      "acceptedAt": acceptedAt,
+                    },
+                  },
+                  "agreementHistory": FieldValue.arrayUnion([
+                    {
+                      "types": [
+                        "customerTerms",
+                        "privacyPolicy",
+                        "returnRefundPolicy",
+                      ],
+                      "termsVersion": customerTermsVersion,
+                      "privacyPolicyVersion": privacyPolicyVersion,
+                      "termsUrl": customerTermsUrl,
+                      "privacyPolicyUrl": privacyPolicyUrl,
+                      "returnRefundPolicyUrl": returnRefundPolicyUrl,
+                      "acceptedAt": Timestamp.now(),
+                      "source": "signup",
+                    },
+                  ]),
+                }, SetOptions(merge: true));
+          }
+
           print("✅ USER CREATED");
 
           if (!mounted) return;
@@ -3592,6 +4297,29 @@ class _AuthScreenState extends State<AuthScreen>
           );
         } catch (e) {
           print("❌ ERROR: $e");
+          String message = "Sign up failed";
+
+          if (e is FirebaseAuthException) {
+            switch (e.code) {
+              case 'email-already-in-use':
+                message = "Email already in use";
+                break;
+              case 'invalid-email':
+                message = "Invalid email format";
+                break;
+              case 'weak-password':
+                message = "Password must be at least 6 characters";
+                break;
+              default:
+                message = e.message ?? "Sign up failed";
+            }
+          }
+
+          if (!mounted) return;
+          setState(() {
+            errorMessage = message;
+            isLoading = false;
+          });
         }
 
         return;
@@ -3648,166 +4376,228 @@ class _AuthScreenState extends State<AuthScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Stack(
-        children: [
-          // 👇 BACKGROUND IMAGE
-          Positioned.fill(
-            child: Image.asset(
-              "assets/images/APPRENTICEAPPLOGO.png",
-              fit: BoxFit.cover,
-            ),
-          ),
+      resizeToAvoidBottomInset: true,
+      backgroundColor: Colors.white,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final keyboardInset = MediaQuery.of(context).viewInsets.bottom;
+          final minHeight = max(0.0, constraints.maxHeight - keyboardInset);
 
-          // 👇 DARK OVERLAY (important)
-          Positioned.fill(
-            child: FadeTransition(
-              opacity: _fadeAnimation,
-              child: Container(color: Colors.black.withOpacity(0.4)),
-            ),
-          ),
-
-          // 👇 LOGIN FORM
-          Align(
-            alignment: Alignment(0, 0.7),
-            child: SingleChildScrollView(
-              child: Padding(
-                padding: EdgeInsets.all(24),
-                child: FadeTransition(
-                  opacity: _fadeAnimation,
-                  child: SlideTransition(
-                    position: _slideAnimation,
-                    child: Container(
-                      padding: EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.90),
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black26,
-                            blurRadius: 15,
-                            offset: Offset(0, 6),
+          return SingleChildScrollView(
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            padding: EdgeInsets.fromLTRB(24, 32, 24, keyboardInset + 24),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: max(0.0, minHeight - 56)),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  helperBrand(context),
+                  SizedBox(height: 24),
+                  Container(
+                    padding: EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black26,
+                          blurRadius: 15,
+                          offset: Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (errorMessage != null)
+                          Container(
+                            width: double.infinity,
+                            margin: EdgeInsets.only(bottom: 15),
+                            padding: EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.red[100],
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: Colors.red),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(Icons.error, color: Colors.red),
+                                SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    errorMessage!,
+                                    style: TextStyle(color: Colors.red[900]),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                        ],
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (errorMessage != null)
-                            Container(
-                              width: double.infinity,
-                              margin: EdgeInsets.only(bottom: 15),
-                              padding: EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: Colors.red[100],
-                                borderRadius: BorderRadius.circular(10),
-                                border: Border.all(color: Colors.red),
+                        Text(
+                          isLogin ? "Login" : "Sign Up",
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+
+                        SizedBox(height: 20),
+
+                        TextField(
+                          controller: emailController,
+                          decoration: InputDecoration(
+                            hintText: "Email",
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                        ),
+
+                        SizedBox(height: 15),
+
+                        TextField(
+                          controller: passwordController,
+                          obscureText: obscurePassword,
+                          decoration: InputDecoration(
+                            hintText: "Password",
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+
+                            // 👇 ADD THIS
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                obscurePassword
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
                               ),
-                              child: Row(
+                              onPressed: () {
+                                setState(() {
+                                  obscurePassword = !obscurePassword;
+                                });
+                              },
+                            ),
+                          ),
+                        ),
+
+                        SizedBox(height: 20),
+
+                        if (!isLogin) ...[
+                          Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.72),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: acceptedCustomerTerms
+                                    ? Colors.orange
+                                    : Colors.grey.shade300,
+                              ),
+                            ),
+                            child: CheckboxListTile(
+                              value: acceptedCustomerTerms,
+                              activeColor: Colors.orange,
+                              controlAffinity: ListTileControlAffinity.leading,
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 2,
+                              ),
+                              title: Wrap(
+                                spacing: 3,
+                                runSpacing: 2,
                                 children: [
-                                  Icon(Icons.error, color: Colors.red),
-                                  SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      errorMessage!,
-                                      style: TextStyle(color: Colors.red[900]),
+                                  Text(
+                                    "I agree to the",
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  policyLink("Terms", customerTermsUrl),
+                                  Text(
+                                    ",",
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  policyLink(
+                                    "Privacy Policy",
+                                    privacyPolicyUrl,
+                                  ),
+                                  Text(
+                                    ", and",
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  policyLink(
+                                    "Return & Refund Policy",
+                                    returnRefundPolicyUrl,
+                                  ),
+                                  Text(
+                                    ".",
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
                                     ),
                                   ),
                                 ],
                               ),
-                            ),
-                          Text(
-                            isLogin ? "Login" : "Sign Up",
-                            style: TextStyle(
-                              fontSize: 24,
-                              fontWeight: FontWeight.bold,
+                              onChanged: (value) {
+                                setState(() {
+                                  acceptedCustomerTerms = value == true;
+                                });
+                              },
                             ),
                           ),
-
                           SizedBox(height: 20),
-
-                          TextField(
-                            controller: emailController,
-                            decoration: InputDecoration(
-                              hintText: "Email",
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                            ),
-                          ),
-
-                          SizedBox(height: 15),
-
-                          TextField(
-                            controller: passwordController,
-                            obscureText: obscurePassword,
-                            decoration: InputDecoration(
-                              hintText: "Password",
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-
-                              // 👇 ADD THIS
-                              suffixIcon: IconButton(
-                                icon: Icon(
-                                  obscurePassword
-                                      ? Icons.visibility
-                                      : Icons.visibility_off,
-                                ),
-                                onPressed: () {
-                                  setState(() {
-                                    obscurePassword = !obscurePassword;
-                                  });
-                                },
-                              ),
-                            ),
-                          ),
-
-                          SizedBox(height: 20),
-
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton(
-                              onPressed: isLoading ? null : submit,
-                              child: isLoading
-                                  ? SizedBox(
-                                      height: 20,
-                                      width: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : Text(isLogin ? "Login" : "Sign Up"),
-                            ),
-                          ),
-
-                          TextButton(
-                            onPressed: () {
-                              setState(() {
-                                isLogin = !isLogin;
-                              });
-                            },
-                            child: Text(
-                              isLogin
-                                  ? "Create account"
-                                  : "Already have an account?",
-                            ),
-                          ),
                         ],
-                      ),
+
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: isLoading ? null : submit,
+                            child: isLoading
+                                ? SizedBox(
+                                    height: 20,
+                                    width: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : Text(isLogin ? "Login" : "Sign Up"),
+                          ),
+                        ),
+
+                        TextButton(
+                          onPressed: () {
+                            setState(() {
+                              isLogin = !isLogin;
+                              errorMessage = null;
+                            });
+                          },
+                          child: Text(
+                            isLogin
+                                ? "Create account"
+                                : "Already have an account?",
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ),
+                ],
               ),
             ),
-          ),
-        ],
+          );
+        },
       ),
     );
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    emailController.dispose();
+    passwordController.dispose();
     super.dispose();
   }
 }
@@ -3821,37 +4611,161 @@ class ProfileScreen extends StatelessWidget {
       appBar: AppBar(title: Text("Profile")),
       body: Padding(
         padding: EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: FutureBuilder<String?>(
+          future: user == null
+              ? Future.value(null)
+              : ensureCustomerDeliveryPin(user.uid),
+          builder: (context, snapshot) {
+            final deliveryPin = snapshot.data;
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "User Info",
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+
+                SizedBox(height: 20),
+
+                Text(
+                  "Email: ${user?.email ?? "No email"}",
+                  style: TextStyle(fontSize: 18),
+                ),
+
+                SizedBox(height: 20),
+
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.orange.shade200),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Delivery PIN",
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.orange.shade900,
+                        ),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        deliveryPin ?? "Loading...",
+                        style: TextStyle(
+                          fontSize: 30,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 6,
+                        ),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        "Give this PIN to your driver when your order arrives.",
+                        style: TextStyle(color: Colors.grey.shade700),
+                      ),
+                    ],
+                  ),
+                ),
+
+                SizedBox(height: 30),
+
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                  onPressed: () async {
+                    await FirebaseAuth.instance.signOut();
+
+                    if (!context.mounted) return;
+
+                    Navigator.pushAndRemoveUntil(
+                      context,
+                      MaterialPageRoute(builder: (_) => RoleRouter()),
+                      (route) => false,
+                    );
+                  },
+                  child: Text("Logout"),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class CustomerHelpScreen extends StatelessWidget {
+  const CustomerHelpScreen({super.key});
+
+  Widget helpSection({
+    required IconData icon,
+    required String title,
+    required String body,
+  }) {
+    return Padding(
+      padding: EdgeInsets.symmetric(vertical: 4),
+      child: ExpansionTile(
+        leading: Icon(icon, color: Colors.blue.shade700),
+        title: Text(title, style: TextStyle(fontWeight: FontWeight.w600)),
+        childrenPadding: EdgeInsets.fromLTRB(56, 0, 20, 16),
+        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            body,
+            style: TextStyle(color: Colors.grey.shade700, height: 1.4),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text("Help")),
+      body: appScreenFade(
+        child: ListView(
+          padding: EdgeInsets.symmetric(vertical: 12),
           children: [
-            Text(
-              "User Info",
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            helpSection(
+              icon: Icons.receipt_long,
+              title: "Order not showing",
+              body:
+                  "Open Order History to confirm the order is Pending. The app automatically checks again for available drivers while the order is waiting.",
             ),
-
-            SizedBox(height: 20),
-
-            Text(
-              "Email: ${user?.email ?? "No email"}",
-              style: TextStyle(fontSize: 18),
+            helpSection(
+              icon: Icons.credit_card,
+              title: "Payment method problems",
+              body:
+                  "Confirm you are online and try adding the payment method again. Test cards only work while the app is using Stripe test mode.",
             ),
-
-            SizedBox(height: 30),
-
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              onPressed: () async {
-                await FirebaseAuth.instance.signOut();
-
-                if (!context.mounted) return;
-
-                Navigator.pushAndRemoveUntil(
-                  context,
-                  MaterialPageRoute(builder: (_) => RoleRouter()),
-                  (route) => false,
-                );
-              },
-              child: Text("Logout"),
+            helpSection(
+              icon: Icons.local_shipping,
+              title: "Delivery tracking",
+              body:
+                  "Open Order History and select the active order. Tracking updates after a driver accepts, picks up, and delivers the order.",
+            ),
+            helpSection(
+              icon: Icons.pin,
+              title: "Delivery PIN",
+              body:
+                  "Your 4-digit delivery PIN confirms the order was handed to you. You can find it during checkout and in your profile. Give it to the driver only when the order arrives. The driver cannot mark the order delivered without it.",
+            ),
+            helpSection(
+              icon: Icons.location_on,
+              title: "Location problems",
+              body:
+                  "Make sure location services and app location permission are enabled, then use Update Location from the customer menu.",
+            ),
+            helpSection(
+              icon: Icons.shopping_cart,
+              title: "Switching trades",
+              body:
+                  "Your current trade cart must be empty before shopping another trade. Remove its items or complete the order to unlock the other trades.",
             ),
           ],
         ),
@@ -3875,7 +4789,7 @@ class _SplashScreenState extends State<SplashScreen>
 
     _controller = AnimationController(
       vsync: this,
-      duration: Duration(seconds: 2),
+      duration: Duration(milliseconds: 1),
     );
 
     _fadeAnimation = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
@@ -3892,7 +4806,7 @@ class _SplashScreenState extends State<SplashScreen>
     // 🔥 TEMP reset(resets User on Mobile Device Cache)
     await FirebaseAuth.instance.signOut();
 
-    await Future.delayed(Duration(seconds: 3));
+    await Future.delayed(Duration.zero);
 
     final user = FirebaseAuth.instance.currentUser;
 
@@ -3900,35 +4814,17 @@ class _SplashScreenState extends State<SplashScreen>
 
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(
-        builder: (_) => user == null ? AuthScreen() : RoleRouter(),
+      PageRouteBuilder(
+        transitionDuration: Duration.zero,
+        reverseTransitionDuration: Duration.zero,
+        pageBuilder: (_, __, ___) => user == null ? AuthScreen() : RoleRouter(),
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
-        children: [
-          // 👇 FULL SCREEN IMAGE
-          Positioned.fill(
-            child: FadeTransition(
-              opacity: _fadeAnimation,
-              child: Image.asset(
-                "assets/images/APPRENTICEAPPLOGO.png",
-                fit: BoxFit.cover,
-              ),
-            ),
-          ),
-
-          // 👇 DARK OVERLAY (adjust opacity here)
-          Positioned.fill(
-            child: Container(color: Colors.black.withOpacity(0.3)),
-          ),
-        ],
-      ),
-    );
+    return Scaffold(backgroundColor: Colors.white, body: SizedBox.expand());
   }
 
   void dispose() {
@@ -3971,90 +4867,52 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
           ],
         ),
       ),
-      body: SingleChildScrollView(
-        child: AbsorbPointer(
-          absorbing: isLoading,
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              children: [
-                SizedBox(height: 20),
+      body: appScreenFade(
+        child: SingleChildScrollView(
+          child: AbsorbPointer(
+            absorbing: isLoading,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  SizedBox(height: 20),
 
-                Text(
-                  "How will you use the app?",
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-                ),
+                  Text(
+                    "How will you use the app?",
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                  ),
 
-                SizedBox(height: 30),
+                  SizedBox(height: 30),
 
-                _roleCard("Customer", Icons.person, Colors.blue),
-                _roleCard("Store", Icons.store, Colors.green),
-                _roleCard("Driver", Icons.local_shipping, Colors.orange),
+                  _roleCard("Customer", Icons.person, Colors.blue),
+                  _roleCard("Store", Icons.store, Colors.green),
+                  _roleCard("Driver", Icons.local_shipping, Colors.orange),
 
-                SizedBox(height: 20),
+                  SizedBox(height: 20),
 
-                AnimatedOpacity(
-                  duration: Duration(milliseconds: 200),
-                  opacity: selectedRole == null ? 0.5 : 1,
-                  child: SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: selectedRole == null || isLoading
-                          ? null
-                          : () async {
-                              setState(() => isLoading = true);
+                  AnimatedOpacity(
+                    duration: Duration(milliseconds: 200),
+                    opacity: selectedRole == null ? 0.5 : 1,
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: selectedRole == null || isLoading
+                            ? null
+                            : () async {
+                                setState(() => isLoading = true);
 
-                              HapticFeedback.mediumImpact();
+                                HapticFeedback.mediumImpact();
 
-                              final user = FirebaseAuth.instance.currentUser;
+                                final user = FirebaseAuth.instance.currentUser;
 
-                              String? storeName;
+                                String? storeName;
 
-                              if (selectedRole == "store") {
-                                storeName = await showDialog<String>(
-                                  context: context,
-                                  barrierDismissible: false,
-                                  builder: (context) {
-                                    final controller = TextEditingController();
-
-                                    return AlertDialog(
-                                      title: Text("Store Name"),
-                                      content: TextField(
-                                        controller: controller,
-                                        textCapitalization:
-                                            TextCapitalization.words,
-                                        decoration: InputDecoration(
-                                          hintText: "Enter your store name",
-                                          border: OutlineInputBorder(),
-                                        ),
-                                      ),
-                                      actions: [
-                                        TextButton(
-                                          onPressed: () =>
-                                              Navigator.pop(context),
-                                          child: Text("Cancel"),
-                                        ),
-                                        ElevatedButton(
-                                          onPressed: () {
-                                            final name = controller.text.trim();
-                                            if (name.isEmpty) return;
-                                            Navigator.pop(context, name);
-                                          },
-                                          child: Text("Save"),
-                                        ),
-                                      ],
-                                    );
-                                  },
-                                );
-
-                                if (storeName == null || storeName.isEmpty) {
-                                  setState(() => isLoading = false);
-                                  return;
+                                if (selectedRole == "store") {
+                                  storeName = null;
                                 }
-                              }
 
-                              // 🔥 SHOW DIALOG FIRST (instant)
-                              /*if (selectedRole == "store") {
+                                // 🔥 SHOW DIALOG FIRST (instant)
+                                /*if (selectedRole == "store") {
                                 storeName = await showDialog<String>(
                                   context: context,
                                   barrierDismissible:
@@ -4120,79 +4978,82 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                                 }
                               }*/
 
-                              await FirebaseFirestore.instance
-                                  .collection('users')
-                                  .doc(user!.uid)
-                                  .set({
-                                    "email": user.email,
-                                    "role": selectedRole,
-                                    "storeName": storeName,
-                                  }, SetOptions(merge: true));
-
-                              // 🔥 CUSTOMER NAME CHECK
-                              if (selectedRole == "customer") {
-                                final user = FirebaseAuth.instance.currentUser;
-
-                                final userDoc = await FirebaseFirestore.instance
+                                await FirebaseFirestore.instance
                                     .collection('users')
                                     .doc(user!.uid)
-                                    .get();
+                                    .set({
+                                      "email": user.email,
+                                      "role": selectedRole,
+                                      "storeName": storeName,
+                                    }, SetOptions(merge: true));
 
-                                final name = userDoc.data()?['name'];
+                                // 🔥 CUSTOMER NAME CHECK
+                                if (selectedRole == "customer") {
+                                  final user =
+                                      FirebaseAuth.instance.currentUser;
 
-                                if (name == null ||
-                                    name.toString().trim().isEmpty) {
-                                  setState(() => isLoading = false);
+                                  final userDoc = await FirebaseFirestore
+                                      .instance
+                                      .collection('users')
+                                      .doc(user!.uid)
+                                      .get();
 
-                                  Navigator.pushReplacement(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => CustomerNameScreen(),
-                                    ),
-                                  );
+                                  final name = userDoc.data()?['name'];
 
-                                  return;
+                                  if (name == null ||
+                                      name.toString().trim().isEmpty) {
+                                    setState(() => isLoading = false);
+
+                                    Navigator.pushReplacement(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) => CustomerNameScreen(),
+                                      ),
+                                    );
+
+                                    return;
+                                  }
                                 }
-                              }
 
-                              // THEN save role
-                              await FirebaseFirestore.instance
-                                  .collection('users')
-                                  .doc(user!.uid)
-                                  .set({
-                                    "email": user.email,
-                                    "role": selectedRole,
-                                    "storeName": storeName,
-                                  }, SetOptions(merge: true));
+                                // THEN save role
+                                await FirebaseFirestore.instance
+                                    .collection('users')
+                                    .doc(user!.uid)
+                                    .set({
+                                      "email": user.email,
+                                      "role": selectedRole,
+                                      "storeName": storeName,
+                                    }, SetOptions(merge: true));
 
-                              await PushNotificationService.saveCurrentToken(
-                                user.uid,
-                              );
+                                await PushNotificationService.saveCurrentToken(
+                                  user.uid,
+                                );
 
-                              setState(() => isLoading = false);
+                                setState(() => isLoading = false);
 
-                              widget.onRoleSelected(selectedRole!);
-                            },
-                      style: ElevatedButton.styleFrom(
-                        padding: EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
+                                widget.onRoleSelected(selectedRole!);
+                              },
+                        style: ElevatedButton.styleFrom(
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
                         ),
+                        child: isLoading
+                            ? SizedBox(
+                                height: 20,
+                                width: 20,
+                                child: CircularProgressIndicator(
+                                  color: Colors.white,
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : Text("Continue", style: TextStyle(fontSize: 18)),
                       ),
-                      child: isLoading
-                          ? SizedBox(
-                              height: 20,
-                              width: 20,
-                              child: CircularProgressIndicator(
-                                color: Colors.white,
-                                strokeWidth: 2,
-                              ),
-                            )
-                          : Text("Continue", style: TextStyle(fontSize: 18)),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -4264,6 +5125,345 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
   }
 }
 
+class AdminDashboardScreen extends StatefulWidget {
+  @override
+  State<AdminDashboardScreen> createState() => _AdminDashboardScreenState();
+}
+
+class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
+  bool isLoading = true;
+  String? errorText;
+  Map<String, dynamic>? dashboard;
+
+  @override
+  void initState() {
+    super.initState();
+    loadDashboard();
+  }
+
+  Future<void> loadDashboard() async {
+    setState(() {
+      isLoading = true;
+      errorText = null;
+    });
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'getAdminDashboard',
+      );
+      final result = await callable.call();
+
+      if (!mounted) return;
+
+      setState(() {
+        dashboard = Map<String, dynamic>.from(result.data as Map);
+        isLoading = false;
+      });
+    } on FirebaseFunctionsException catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        errorText = error.message ?? "Could not load admin dashboard.";
+        isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        errorText = "Could not load admin dashboard.";
+        isLoading = false;
+      });
+    }
+  }
+
+  List<Map<String, dynamic>> adminList(String key) {
+    final value = dashboard?[key];
+    if (value is! List) return [];
+    return value.map((item) => Map<String, dynamic>.from(item as Map)).toList();
+  }
+
+  Future<void> openAdminContact(Uri uri) async {
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Could not open contact option.")));
+    }
+  }
+
+  Widget? contactMenu({String? email, String? phone}) {
+    final cleanedEmail = email?.trim();
+    final cleanedPhone = phone?.trim();
+    final hasEmail = cleanedEmail != null && cleanedEmail.isNotEmpty;
+    final hasPhone = cleanedPhone != null && cleanedPhone.isNotEmpty;
+
+    if (!hasEmail && !hasPhone) return null;
+
+    return PopupMenuButton<String>(
+      tooltip: "Contact",
+      icon: Icon(Icons.more_vert),
+      onSelected: (value) {
+        if (value == "email" && hasEmail) {
+          openAdminContact(Uri(scheme: "mailto", path: cleanedEmail));
+        } else if (value == "phone" && hasPhone) {
+          openAdminContact(Uri(scheme: "tel", path: cleanedPhone));
+        }
+      },
+      itemBuilder: (context) => [
+        if (hasEmail)
+          PopupMenuItem(
+            value: "email",
+            child: Row(
+              children: [
+                Icon(Icons.email_outlined, size: 18),
+                SizedBox(width: 8),
+                Text("Email"),
+              ],
+            ),
+          ),
+        if (hasPhone)
+          PopupMenuItem(
+            value: "phone",
+            child: Row(
+              children: [
+                Icon(Icons.phone_outlined, size: 18),
+                SizedBox(width: 8),
+                Text("Call"),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget metricCard(String label, int count, Color color) {
+    return Expanded(
+      child: Container(
+        padding: EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: color.withOpacity(0.35)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              "$count",
+              style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 4),
+            Text(
+              label,
+              style: TextStyle(
+                color: Colors.grey.shade700,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  int countValue(Map<String, dynamic> counts, String key) {
+    final value = counts[key];
+    return value is num ? value.toInt() : 0;
+  }
+
+  Widget section({
+    required String title,
+    required List<Map<String, dynamic>> items,
+    required Widget Function(Map<String, dynamic>) itemBuilder,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(height: 22),
+        Text(
+          title,
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        SizedBox(height: 8),
+        if (items.isEmpty)
+          Container(
+            width: double.infinity,
+            padding: EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Colors.grey.shade100,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.grey.shade300),
+            ),
+            child: Text("Nothing to show"),
+          )
+        else
+          ...items.map(itemBuilder),
+      ],
+    );
+  }
+
+  Widget orderTile(Map<String, dynamic> order) {
+    final status = order["status"]?.toString() ?? "Unknown";
+    final payoutError = order["driverPayoutError"]?.toString();
+
+    return Card(
+      margin: EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        leading: CircleAvatar(child: Icon(Icons.receipt_long)),
+        title: Text("${order["storeName"] ?? "Store"} • $status"),
+        subtitle: Text(
+          [
+            "Customer: ${order["customerName"] ?? "Customer"}",
+            "Total: \$${((order["total"] ?? 0) as num).toDouble().toStringAsFixed(2)}",
+            if (payoutError != null && payoutError.isNotEmpty)
+              "Payout issue: $payoutError",
+          ].join("\n"),
+        ),
+        isThreeLine: payoutError != null && payoutError.isNotEmpty,
+      ),
+    );
+  }
+
+  Widget userTile(Map<String, dynamic> user) {
+    final email = user["email"]?.toString();
+    final phone = user["phone"]?.toString();
+
+    return Card(
+      margin: EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        leading: CircleAvatar(child: Icon(Icons.person)),
+        title: Text(
+          user["name"]?.toString() ?? user["email"]?.toString() ?? "User",
+        ),
+        subtitle: Text(
+          [
+            "Role: ${user["role"] ?? "unknown"}",
+            if (user["email"] != null) "Email: ${user["email"]}",
+            if (user["phone"] != null) "Phone: ${user["phone"]}",
+          ].join("\n"),
+        ),
+        trailing: contactMenu(email: email, phone: phone),
+      ),
+    );
+  }
+
+  Widget driverTile(Map<String, dynamic> driver) {
+    final phone = driver["phone"]?.toString();
+
+    return Card(
+      margin: EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        leading: CircleAvatar(child: Icon(Icons.local_shipping)),
+        title: Text(driver["name"]?.toString() ?? "Driver"),
+        subtitle: Text(
+          [
+            "Online: ${driver["isOnline"] == true ? "yes" : "no"}",
+            "Busy: ${driver["isBusy"] == true ? "yes" : "no"}",
+            "Earnings: \$${((driver["earnings"] ?? 0) as num).toDouble().toStringAsFixed(2)}",
+          ].join("\n"),
+        ),
+        trailing: contactMenu(phone: phone),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = dashboard?["counts"] is Map
+        ? Map<String, dynamic>.from(dashboard!["counts"] as Map)
+        : <String, dynamic>{};
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Admin Dashboard"),
+        actions: [
+          IconButton(
+            tooltip: "Refresh",
+            onPressed: isLoading ? null : loadDashboard,
+            icon: Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: appScreenFade(
+        child: isLoading
+            ? Center(child: CircularProgressIndicator())
+            : errorText != null
+            ? Center(
+                child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text(errorText!, textAlign: TextAlign.center),
+                ),
+              )
+            : RefreshIndicator(
+                onRefresh: loadDashboard,
+                child: ListView(
+                  padding: EdgeInsets.all(16),
+                  children: [
+                    Row(
+                      children: [
+                        metricCard(
+                          "Payout issues",
+                          countValue(counts, "payoutIssues"),
+                          Colors.red,
+                        ),
+                        SizedBox(width: 10),
+                        metricCard(
+                          "Store issues",
+                          countValue(counts, "storeIssues"),
+                          Colors.orange,
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: 10),
+                    Row(
+                      children: [
+                        metricCard(
+                          "Recent orders",
+                          countValue(counts, "recentOrders"),
+                          Colors.blue,
+                        ),
+                        SizedBox(width: 10),
+                        metricCard(
+                          "Drivers loaded",
+                          countValue(counts, "driversLoaded"),
+                          Colors.green,
+                        ),
+                      ],
+                    ),
+                    section(
+                      title: "Payout Issues",
+                      items: adminList("payoutIssues"),
+                      itemBuilder: orderTile,
+                    ),
+                    section(
+                      title: "Store Issues",
+                      items: adminList("storeIssues"),
+                      itemBuilder: orderTile,
+                    ),
+                    section(
+                      title: "Recent Orders",
+                      items: adminList("recentOrders"),
+                      itemBuilder: orderTile,
+                    ),
+                    section(
+                      title: "Recent Users",
+                      items: adminList("users"),
+                      itemBuilder: userTile,
+                    ),
+                    section(
+                      title: "Drivers",
+                      items: adminList("drivers"),
+                      itemBuilder: driverTile,
+                    ),
+                  ],
+                ),
+              ),
+      ),
+    );
+  }
+}
+
 class RoleRouter extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -4325,6 +5525,10 @@ class _RoleRouterContent extends StatelessWidget {
           return LocationPermissionScreen();
         }
 
+        if (isOwnerAdminEmail(user.email)) {
+          return AdminDashboardScreen();
+        }
+
         // 🔥 2. ROLE
         if (data['role'] == null) {
           return _buildRoleSelection();
@@ -4334,46 +5538,68 @@ class _RoleRouterContent extends StatelessWidget {
 
         // 🔥 3. CUSTOMER NAME
         if (role == "customer") {
-          final name = data['name'];
+          return CameraPermissionGate(
+            child: Builder(
+              builder: (context) {
+                final name = data['name'];
 
-          if (name == null || name.toString().trim().isEmpty) {
-            return CustomerNameScreen();
-          }
+                if (name == null || name.toString().trim().isEmpty) {
+                  return CustomerNameScreen();
+                }
+
+                return TradeStoreScreen();
+              },
+            ),
+          );
         }
 
         // 🔥 4. FINAL ROUTING
         if (role == "store") {
+          final existingStoreName = data['storeName']?.toString().trim() ?? "";
+
+          if (data['storeOnboardingComplete'] != true &&
+              existingStoreName.isEmpty) {
+            return StoreOnboardingScreen();
+          }
+
+          if (data['storeOnboardingComplete'] == true &&
+              data['storeInventoryOnboardingComplete'] != true) {
+            return StoreInventoryTagsOnboardingScreen();
+          }
+
           final storeName = data['storeName'] ?? "My Store";
           return StoreDashboardScreen(storeName: storeName);
         } else if (role == "driver") {
-          return FutureBuilder<DocumentSnapshot>(
-            future: FirebaseFirestore.instance
-                .collection('drivers')
-                .doc(user.uid)
-                .get(),
-            builder: (context, driverSnapshot) {
-              if (!driverSnapshot.hasData) {
-                return Scaffold(
-                  body: Center(child: CircularProgressIndicator()),
-                );
-              }
+          return CameraPermissionGate(
+            child: FutureBuilder<DocumentSnapshot>(
+              future: FirebaseFirestore.instance
+                  .collection('drivers')
+                  .doc(user.uid)
+                  .get(),
+              builder: (context, driverSnapshot) {
+                if (!driverSnapshot.hasData) {
+                  return Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  );
+                }
 
-              final driverDoc = driverSnapshot.data;
+                final driverDoc = driverSnapshot.data;
 
-              if (driverDoc == null || !driverDoc.exists) {
-                // 🔥 NO DRIVER PROFILE → SHOW ONBOARDING
-                return DriverOnboardingScreen();
-              }
+                if (driverDoc == null || !driverDoc.exists) {
+                  // 🔥 NO DRIVER PROFILE → SHOW ONBOARDING
+                  return DriverOnboardingScreen();
+                }
 
-              final driverData = driverDoc.data() as Map<String, dynamic>?;
+                final driverData = driverDoc.data() as Map<String, dynamic>?;
 
-              if (driverData?['onboardingComplete'] != true) {
-                return DriverOnboardingScreen();
-              }
+                if (driverData?['onboardingComplete'] != true) {
+                  return DriverOnboardingScreen();
+                }
 
-              // ✅ HAS PROFILE → GO TO DRIVER SCREEN
-              return DriverScreen();
-            },
+                // ✅ HAS PROFILE → GO TO DRIVER SCREEN
+                return DriverScreen();
+              },
+            ),
           );
         } else {
           return TradeStoreScreen();
@@ -4393,6 +5619,919 @@ class _RoleRouterContent extends StatelessWidget {
   }
 }
 
+class CameraPermissionGate extends StatelessWidget {
+  final Widget child;
+
+  const CameraPermissionGate({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<app_permissions.PermissionStatus>(
+      future: app_permissions.Permission.camera.status,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+
+        if (snapshot.data!.isGranted) {
+          return child;
+        }
+
+        return CameraPermissionScreen();
+      },
+    );
+  }
+}
+
+class CameraPermissionScreen extends StatefulWidget {
+  const CameraPermissionScreen({super.key});
+
+  @override
+  State<CameraPermissionScreen> createState() => _CameraPermissionScreenState();
+}
+
+class _CameraPermissionScreenState extends State<CameraPermissionScreen> {
+  bool isLoading = false;
+
+  Future<void> handleCameraPermission() async {
+    setState(() => isLoading = true);
+
+    var status = await app_permissions.Permission.camera.status;
+
+    if (status.isDenied || status.isLimited || status.isRestricted) {
+      status = await app_permissions.Permission.camera.request();
+    }
+
+    if (!mounted) return;
+
+    if (status.isGranted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => RoleRouter()),
+      );
+      return;
+    }
+
+    if (status.isPermanentlyDenied) {
+      await showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text("Camera Required"),
+          content: Text(
+            "Camera access is turned off. Please enable it in Settings to continue.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                await app_permissions.openAppSettings();
+              },
+              child: Text("Open Settings"),
+            ),
+          ],
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Please allow camera access to continue")),
+      );
+    }
+
+    if (mounted) {
+      setState(() => isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.photo_camera, size: 80, color: Colors.orange),
+            SizedBox(height: 20),
+            Text(
+              "Enable Camera",
+              style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 10),
+            Text(
+              "We use camera access for delivery proof, receipts, and order support photos.",
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey),
+            ),
+            SizedBox(height: 40),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: isLoading ? null : handleCameraPermission,
+                child: isLoading
+                    ? CircularProgressIndicator(color: Colors.white)
+                    : Text("Enable Camera"),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class StoreOnboardingScreen extends StatefulWidget {
+  const StoreOnboardingScreen({super.key});
+
+  @override
+  State<StoreOnboardingScreen> createState() => _StoreOnboardingScreenState();
+}
+
+class _StoreOnboardingScreenState extends State<StoreOnboardingScreen> {
+  final searchController = TextEditingController();
+  final nameController = TextEditingController();
+  final addressController = TextEditingController();
+  final days = const [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+  ];
+
+  late final List<TextEditingController> hoursControllers;
+  List<Map<String, dynamic>> results = [];
+  List<Map<String, dynamic>> selectedHoursPeriods = [];
+  String? selectedPlaceId;
+  double? selectedLatitude;
+  double? selectedLongitude;
+  int? selectedUtcOffsetMinutes;
+  bool isSearching = false;
+  bool isSaving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    hoursControllers = List.generate(
+      7,
+      (_) => TextEditingController(text: "Closed"),
+    );
+  }
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    nameController.dispose();
+    addressController.dispose();
+    for (final controller in hoursControllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> searchStores() async {
+    final query = searchController.text.trim();
+    if (query.length < 3 || isSearching) return;
+
+    setState(() {
+      isSearching = true;
+      results = [];
+    });
+
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      final userDoc = user == null
+          ? null
+          : await FirebaseFirestore.instance
+                .collection('users')
+                .doc(user.uid)
+                .get();
+      final userData = userDoc?.data();
+
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'searchStorePlaces',
+      );
+      final response = await callable.call({
+        "query": query,
+        "latitude": userData?['lat'],
+        "longitude": userData?['lng'],
+      });
+
+      final rawPlaces = (response.data?['places'] as List?) ?? [];
+      if (!mounted) return;
+
+      setState(() {
+        results = rawPlaces
+            .whereType<Map>()
+            .map((place) => Map<String, dynamic>.from(place))
+            .toList();
+      });
+    } on FirebaseFunctionsException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(error.message ?? "Could not search for stores."),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Could not search for stores right now.")),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => isSearching = false);
+      }
+    }
+  }
+
+  void selectStore(Map<String, dynamic> place) {
+    final placeHours = (place['hours'] as List?) ?? [];
+
+    setState(() {
+      selectedPlaceId = place['placeId']?.toString();
+      selectedLatitude = (place['latitude'] as num?)?.toDouble();
+      selectedLongitude = (place['longitude'] as num?)?.toDouble();
+      selectedUtcOffsetMinutes = (place['utcOffsetMinutes'] as num?)?.toInt();
+      selectedHoursPeriods = ((place['hoursPeriods'] as List?) ?? [])
+          .whereType<Map>()
+          .map((period) => Map<String, dynamic>.from(period))
+          .toList();
+      nameController.text = place['name']?.toString() ?? "";
+      addressController.text = place['address']?.toString() ?? "";
+      results = [];
+    });
+
+    for (var index = 0; index < hoursControllers.length; index++) {
+      final description = index < placeHours.length
+          ? placeHours[index].toString()
+          : "${days[index]}: Closed";
+      hoursControllers[index].text = description.contains(":")
+          ? description.split(":").skip(1).join(":").trim()
+          : description;
+    }
+  }
+
+  Future<void> useCurrentLocation() async {
+    try {
+      final position = await requestLocation();
+      if (position == null || !mounted) return;
+
+      setState(() {
+        selectedPlaceId = null;
+        selectedLatitude = position.latitude;
+        selectedLongitude = position.longitude;
+        selectedUtcOffsetMinutes = null;
+        selectedHoursPeriods = [];
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Current location added. Enter the address.")),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Could not get your current location.")),
+      );
+    }
+  }
+
+  Future<void> saveStore() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final name = nameController.text.trim();
+    final address = addressController.text.trim();
+
+    if (user == null || isSaving) return;
+
+    if (name.isEmpty ||
+        address.isEmpty ||
+        selectedLatitude == null ||
+        selectedLongitude == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            "Add the store name, address, and select a Google result or current location.",
+          ),
+        ),
+      );
+      return;
+    }
+
+    setState(() => isSaving = true);
+
+    try {
+      final hours = <String, String>{};
+      for (var index = 0; index < days.length; index++) {
+        final value = hoursControllers[index].text.trim();
+        hours[days[index]] = value.isEmpty ? "Closed" : value;
+      }
+
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+        "role": "store",
+        "storeName": name,
+        "address": address,
+        "storePlaceId": selectedPlaceId,
+        "lat": selectedLatitude,
+        "lng": selectedLongitude,
+        "storeHours": hours,
+        "storeHoursPeriods": selectedHoursPeriods,
+        "storeUtcOffsetMinutes": selectedUtcOffsetMinutes,
+        "storeOnboardingComplete": true,
+        "storeInventoryOnboardingComplete": false,
+        "storeOnboardingCompletedAt": FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      await PushNotificationService.saveCurrentToken(user.uid);
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Could not save the store. Please try again.")),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => isSaving = false);
+      }
+    }
+  }
+
+  InputDecoration fieldDecoration({
+    required String label,
+    IconData? icon,
+    String? hint,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      prefixIcon: icon == null ? null : Icon(icon),
+      filled: true,
+      fillColor: Colors.grey.shade50,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(color: Colors.grey.shade300),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(color: Colors.green.shade700, width: 2),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Set Up Your Store"),
+        centerTitle: true,
+        automaticallyImplyLeading: false,
+      ),
+      body: appScreenFade(
+        child: SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
+                child: Row(
+                  children: List.generate(
+                    3,
+                    (index) => Expanded(
+                      child: Container(
+                        height: 5,
+                        margin: EdgeInsets.only(right: index == 2 ? 0 : 8),
+                        decoration: BoxDecoration(
+                          color: Colors.green.shade700,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Expanded(
+                child: ListView(
+                  padding: EdgeInsets.fromLTRB(16, 6, 16, 24),
+                  children: [
+                    Text(
+                      "Find your business",
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      "Search Google to fill in your store details, then review them before continuing.",
+                      style: TextStyle(
+                        color: Colors.grey.shade700,
+                        height: 1.35,
+                      ),
+                    ),
+                    SizedBox(height: 18),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: searchController,
+                            textInputAction: TextInputAction.search,
+                            onSubmitted: (_) => searchStores(),
+                            decoration: fieldDecoration(
+                              label: "Search store",
+                              icon: Icons.search,
+                              hint: "Store name and city",
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: 10),
+                        SizedBox(
+                          width: 52,
+                          height: 56,
+                          child: IconButton.filled(
+                            tooltip: "Search Google",
+                            onPressed: isSearching ? null : searchStores,
+                            icon: isSearching
+                                ? SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Icon(Icons.arrow_forward),
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.green.shade700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (results.isNotEmpty) ...[
+                      SizedBox(height: 10),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey.shade300),
+                        ),
+                        child: Column(
+                          children: List.generate(results.length, (index) {
+                            final place = results[index];
+                            return Column(
+                              children: [
+                                ListTile(
+                                  leading: Icon(
+                                    Icons.store,
+                                    color: Colors.green.shade700,
+                                  ),
+                                  title: Text(
+                                    place['name']?.toString() ?? "Store",
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  subtitle: Text(
+                                    place['address']?.toString() ?? "",
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  trailing: Icon(Icons.chevron_right),
+                                  onTap: () => selectStore(place),
+                                ),
+                                if (index < results.length - 1)
+                                  Divider(height: 1),
+                              ],
+                            );
+                          }),
+                        ),
+                      ),
+                    ],
+                    SizedBox(height: 18),
+                    TextField(
+                      controller: nameController,
+                      textCapitalization: TextCapitalization.words,
+                      decoration: fieldDecoration(
+                        label: "Store name",
+                        icon: Icons.storefront,
+                      ),
+                    ),
+                    SizedBox(height: 12),
+                    TextField(
+                      controller: addressController,
+                      minLines: 1,
+                      maxLines: 2,
+                      textCapitalization: TextCapitalization.words,
+                      decoration: fieldDecoration(
+                        label: "Store address",
+                        icon: Icons.location_on,
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: useCurrentLocation,
+                        icon: Icon(Icons.my_location),
+                        label: Text("Use current location"),
+                      ),
+                    ),
+                    SizedBox(height: 14),
+                    Text(
+                      "Hours of operation",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 10),
+                    ...List.generate(
+                      days.length,
+                      (index) => Padding(
+                        padding: EdgeInsets.only(bottom: 10),
+                        child: TextField(
+                          controller: hoursControllers[index],
+                          onChanged: (_) {
+                            selectedHoursPeriods = [];
+                          },
+                          decoration: fieldDecoration(
+                            label: days[index],
+                            hint: "9:00 AM - 5:00 PM or Closed",
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    SizedBox(
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        onPressed: isSaving ? null : saveStore,
+                        icon: isSaving
+                            ? SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              )
+                            : Icon(Icons.check_circle),
+                        label: Text(
+                          isSaving ? "Saving Store..." : "Finish Store Setup",
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade700,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String storeInventoryItemKey(Map<String, dynamic> item) {
+  final raw = "${item['trade']}|${item['name']}";
+  return base64Url.encode(utf8.encode(raw));
+}
+
+List<Map<String, dynamic>> storeInventoryCatalog() {
+  final plumbingParts = plumbingCatalogParts.map((item) {
+    return {
+      "trade": "Plumbing",
+      "name": item["name"] ?? "Part",
+      "image": item["image"],
+      "categories": item["categories"] ?? [],
+    };
+  });
+
+  final hvacParts = hvacCatalogParts.map((item) {
+    return {
+      "trade": "HVAC",
+      "name": item["name"] ?? "Part",
+      "image": item["image"],
+      "categories": item["categories"] ?? [],
+    };
+  });
+
+  final seen = <String>{};
+  final combined = [...plumbingParts, ...hvacParts].where((item) {
+    final key = storeInventoryItemKey(item);
+    if (!seen.add(key)) return false;
+    return true;
+  }).toList();
+
+  combined.sort((a, b) {
+    final tradeCompare = a['trade'].toString().compareTo(b['trade'].toString());
+    if (tradeCompare != 0) return tradeCompare;
+    return a['name'].toString().compareTo(b['name'].toString());
+  });
+
+  return combined;
+}
+
+class StoreInventoryTagsOnboardingScreen extends StatefulWidget {
+  const StoreInventoryTagsOnboardingScreen({super.key});
+
+  @override
+  State<StoreInventoryTagsOnboardingScreen> createState() =>
+      _StoreInventoryTagsOnboardingScreenState();
+}
+
+class _StoreInventoryTagsOnboardingScreenState
+    extends State<StoreInventoryTagsOnboardingScreen> {
+  final selectedTags = <String>{};
+  final searchController = TextEditingController();
+  String searchText = "";
+  bool isSaving = false;
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
+  Map<String, Map<String, int>> groupedTags(List<Map<String, dynamic>> parts) {
+    final grouped = <String, Map<String, int>>{};
+
+    for (final item in parts) {
+      final trade = item['trade'].toString();
+      final categories = (item['categories'] as List?) ?? [];
+      final tradeTags = grouped.putIfAbsent(trade, () => {});
+
+      for (final category in categories) {
+        final tag = category.toString().trim();
+        if (tag.isEmpty) continue;
+        tradeTags[tag] = (tradeTags[tag] ?? 0) + 1;
+      }
+    }
+
+    for (final tags in grouped.values) {
+      final sorted = tags.entries.toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+      tags
+        ..clear()
+        ..addEntries(sorted);
+    }
+
+    return grouped;
+  }
+
+  String tagKey(String trade, String tag) => "$trade|$tag";
+
+  bool itemMatchesSelectedTag(Map<String, dynamic> item) {
+    final trade = item['trade'].toString();
+    final categories = (item['categories'] as List?) ?? [];
+
+    return categories.any((category) {
+      final tag = category.toString().trim();
+      return selectedTags.contains(tagKey(trade, tag));
+    });
+  }
+
+  Future<void> saveInventoryTags(List<Map<String, dynamic>> parts) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || isSaving) return;
+
+    if (selectedTags.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Select at least one parts group.")),
+      );
+      return;
+    }
+
+    setState(() => isSaving = true);
+
+    try {
+      final inventory = <String, dynamic>{};
+
+      for (final item in parts) {
+        inventory[storeInventoryItemKey(item)] = {
+          "carries": itemMatchesSelectedTag(item),
+          "name": item['name'],
+          "trade": item['trade'],
+          "image": item['image'],
+          "updatedAt": DateTime.now().toIso8601String(),
+        };
+      }
+
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+        "storeInventory": inventory,
+        "storeInventoryTags": selectedTags.toList()..sort(),
+        "storeInventoryOnboardingComplete": true,
+        "storeInventoryOnboardingCompletedAt": FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Could not save inventory groups.")),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => isSaving = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = storeInventoryCatalog();
+    final groups = groupedTags(parts);
+    final query = searchText.trim().toLowerCase();
+    final selectedPartCount = parts.where(itemMatchesSelectedTag).length;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text("Choose Parts Groups"),
+        centerTitle: true,
+        automaticallyImplyLeading: false,
+      ),
+      body: appScreenFade(
+        child: SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
+                child: Row(
+                  children: List.generate(
+                    3,
+                    (index) => Expanded(
+                      child: Container(
+                        height: 5,
+                        margin: EdgeInsets.only(right: index == 2 ? 0 : 8),
+                        decoration: BoxDecoration(
+                          color: index < 2
+                              ? Colors.green.shade700
+                              : Colors.orange,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 4, 16, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "What parts does your store carry?",
+                      style: TextStyle(
+                        fontSize: 23,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      "Select groups. Every matching part will be checked in your inventory automatically.",
+                      style: TextStyle(
+                        color: Colors.grey.shade700,
+                        height: 1.35,
+                      ),
+                    ),
+                    SizedBox(height: 14),
+                    TextField(
+                      controller: searchController,
+                      onChanged: (value) => setState(() => searchText = value),
+                      decoration: InputDecoration(
+                        hintText: "Search parts groups",
+                        prefixIcon: Icon(Icons.search),
+                        filled: true,
+                        fillColor: Colors.white,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 10),
+                    Text(
+                      "${selectedTags.length} groups selected • $selectedPartCount parts checked",
+                      style: TextStyle(
+                        color: Colors.green.shade800,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: ListView(
+                  padding: EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  children: groups.entries.map((tradeEntry) {
+                    final visibleTags = tradeEntry.value.entries.where((entry) {
+                      return query.isEmpty ||
+                          entry.key.toLowerCase().contains(query) ||
+                          tradeEntry.key.toLowerCase().contains(query);
+                    }).toList();
+
+                    if (visibleTags.isEmpty) return SizedBox.shrink();
+
+                    return Padding(
+                      padding: EdgeInsets.only(bottom: 12),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey.shade200),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Padding(
+                              padding: EdgeInsets.fromLTRB(14, 13, 14, 8),
+                              child: Text(
+                                tradeEntry.key,
+                                style: TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            ...visibleTags.map((entry) {
+                              final key = tagKey(tradeEntry.key, entry.key);
+                              final selected = selectedTags.contains(key);
+
+                              return CheckboxListTile(
+                                value: selected,
+                                activeColor: Colors.green.shade700,
+                                controlAffinity:
+                                    ListTileControlAffinity.leading,
+                                title: Text(
+                                  entry.key,
+                                  style: TextStyle(fontWeight: FontWeight.w600),
+                                ),
+                                subtitle: Text(
+                                  "${entry.value} matching ${entry.value == 1 ? 'part' : 'parts'}",
+                                ),
+                                onChanged: (value) {
+                                  setState(() {
+                                    if (value == true) {
+                                      selectedTags.add(key);
+                                    } else {
+                                      selectedTags.remove(key);
+                                    }
+                                  });
+                                },
+                              );
+                            }),
+                          ],
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 10, 16, 16),
+                child: SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton.icon(
+                    onPressed: isSaving ? null : () => saveInventoryTags(parts),
+                    icon: isSaving
+                        ? SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : Icon(Icons.checklist),
+                    label: Text(
+                      isSaving ? "Building Inventory..." : "Finish Inventory",
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green.shade700,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class StoreDashboardScreen extends StatefulWidget {
   final String storeName;
 
@@ -4403,6 +6542,138 @@ class StoreDashboardScreen extends StatefulWidget {
 }
 
 class _StoreDashboardScreenState extends State<StoreDashboardScreen> {
+  Timer? storeHoursTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    storeHoursTimer = Timer.periodic(Duration(minutes: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    storeHoursTimer?.cancel();
+    super.dispose();
+  }
+
+  bool isStoreOpen(Map<String, dynamic>? data) {
+    if (data == null) return true;
+
+    final offset = (data['storeUtcOffsetMinutes'] as num?)?.toInt();
+    final now = offset == null
+        ? DateTime.now()
+        : DateTime.now().toUtc().add(Duration(minutes: offset));
+    final periods = (data['storeHoursPeriods'] as List?) ?? [];
+
+    if (periods.isNotEmpty) {
+      final currentDay = now.weekday % 7;
+      final currentWeekMinute = currentDay * 1440 + now.hour * 60 + now.minute;
+      const weekMinutes = 7 * 1440;
+
+      for (final rawPeriod in periods) {
+        if (rawPeriod is! Map) continue;
+
+        final period = Map<String, dynamic>.from(rawPeriod);
+        final open = period['open'];
+        final close = period['close'];
+        if (open is! Map) continue;
+
+        final openDay = (open['day'] as num?)?.toInt();
+        final openHour = (open['hour'] as num?)?.toInt() ?? 0;
+        final openMinute = (open['minute'] as num?)?.toInt() ?? 0;
+        if (openDay == null) continue;
+
+        if (close is! Map) return true;
+
+        final closeDay = (close['day'] as num?)?.toInt();
+        final closeHour = (close['hour'] as num?)?.toInt() ?? 0;
+        final closeMinute = (close['minute'] as num?)?.toInt() ?? 0;
+        if (closeDay == null) continue;
+
+        final openWeekMinute = openDay * 1440 + openHour * 60 + openMinute;
+        var closeWeekMinute = closeDay * 1440 + closeHour * 60 + closeMinute;
+
+        if (closeWeekMinute <= openWeekMinute) {
+          closeWeekMinute += weekMinutes;
+        }
+
+        if ((currentWeekMinute >= openWeekMinute &&
+                currentWeekMinute < closeWeekMinute) ||
+            (currentWeekMinute + weekMinutes >= openWeekMinute &&
+                currentWeekMinute + weekMinutes < closeWeekMinute)) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    final hours = data['storeHours'];
+    if (hours is! Map || hours.isEmpty) return true;
+
+    const dayNames = [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+      "Sunday",
+    ];
+    final today = dayNames[now.weekday - 1];
+    final schedule = hours[today]?.toString().trim() ?? "";
+
+    return isTimeWithinSchedule(schedule, now);
+  }
+
+  bool isTimeWithinSchedule(String schedule, DateTime now) {
+    if (schedule.isEmpty) return true;
+
+    final normalized = schedule
+        .replaceAll("–", "-")
+        .replaceAll("—", "-")
+        .replaceAll(" ", " ")
+        .replaceAll(" ", " ")
+        .trim();
+    final lower = normalized.toLowerCase();
+
+    if (lower == "closed") return false;
+    if (lower.contains("open 24 hours") || lower == "24 hours") return true;
+
+    final parts = normalized.split(RegExp(r'\s+-\s+'));
+    if (parts.length != 2) return false;
+
+    final openMinutes = parseClockMinutes(parts[0]);
+    final closeMinutes = parseClockMinutes(parts[1]);
+    if (openMinutes == null || closeMinutes == null) return false;
+
+    final currentMinutes = now.hour * 60 + now.minute;
+
+    if (closeMinutes > openMinutes) {
+      return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+    }
+
+    return currentMinutes >= openMinutes || currentMinutes < closeMinutes;
+  }
+
+  int? parseClockMinutes(String value) {
+    final match = RegExp(
+      r'^(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])$',
+    ).firstMatch(value.trim());
+    if (match == null) return null;
+
+    var hour = int.parse(match.group(1)!);
+    final minute = int.tryParse(match.group(2) ?? "0") ?? 0;
+    final period = match.group(3)!.toUpperCase();
+
+    if (hour == 12) hour = 0;
+    if (period == "PM") hour += 12;
+
+    return hour * 60 + minute;
+  }
+
   Future<void> updateStoreName() async {
     final user = FirebaseAuth.instance.currentUser;
     final controller = TextEditingController(text: widget.storeName);
@@ -4502,10 +6773,89 @@ class _StoreDashboardScreenState extends State<StoreDashboardScreen> {
     final user = FirebaseAuth.instance.currentUser;
 
     return Scaffold(
-      backgroundColor: Colors.grey.shade100,
+      drawer: Drawer(
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            Container(
+              height: MediaQuery.paddingOf(context).top + kToolbarHeight,
+              padding: EdgeInsets.fromLTRB(
+                20,
+                MediaQuery.paddingOf(context).top,
+                16,
+                0,
+              ),
+              color: Colors.green.shade700,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                "Store Menu",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            ListTile(
+              leading: Icon(Icons.edit),
+              title: Text("Update Store Name"),
+              onTap: () {
+                Navigator.pop(context);
+                updateStoreName();
+              },
+            ),
+            Divider(height: 1, color: Colors.grey.shade300),
+            ListTile(
+              leading: Icon(Icons.location_on),
+              title: Text("Update Store Location"),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => AddressSearchScreen()),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
       appBar: AppBar(
-        title: Text(widget.storeName),
+        title: StreamBuilder<DocumentSnapshot>(
+          stream: user == null
+              ? null
+              : FirebaseFirestore.instance
+                    .collection('users')
+                    .doc(user.uid)
+                    .snapshots(),
+          builder: (context, snapshot) {
+            final data = snapshot.data?.data() as Map<String, dynamic>?;
+            final isOpen = isStoreOpen(data);
+
+            return AnimatedSwitcher(
+              duration: Duration(milliseconds: 350),
+              child: SizedBox(
+                key: ValueKey(isOpen),
+                width: isOpen ? 132 : 148,
+                height: 48,
+                child: Image.asset(
+                  isOpen
+                      ? "assets/images/neon_open_sign_hd.png"
+                      : "assets/images/neon_closed_sign_hd.png",
+                  fit: BoxFit.contain,
+                  filterQuality: FilterQuality.high,
+                ),
+              ),
+            );
+          },
+        ),
         centerTitle: true,
+        leading: Builder(
+          builder: (context) => IconButton(
+            tooltip: "Store menu",
+            icon: Icon(Icons.store),
+            onPressed: () => Scaffold.of(context).openDrawer(),
+          ),
+        ),
         actions: [
           IconButton(
             tooltip: "Inventory",
@@ -4519,107 +6869,178 @@ class _StoreDashboardScreenState extends State<StoreDashboardScreen> {
           ),
         ],
       ),
-      body: StreamBuilder<DocumentSnapshot>(
-        stream: user == null
-            ? null
-            : FirebaseFirestore.instance
-                  .collection('users')
-                  .doc(user.uid)
-                  .snapshots(),
-        builder: (context, snapshot) {
-          final data = snapshot.data?.data() as Map<String, dynamic>?;
-          final storeName = data?['storeName'] ?? widget.storeName;
-          final address = data?['address'] ?? 'No store address saved yet';
+      body: appScreenFade(
+        child: StreamBuilder<DocumentSnapshot>(
+          stream: user == null
+              ? null
+              : FirebaseFirestore.instance
+                    .collection('users')
+                    .doc(user.uid)
+                    .snapshots(),
+          builder: (context, snapshot) {
+            final data = snapshot.data?.data() as Map<String, dynamic>?;
+            final storeName = data?['storeName'] ?? widget.storeName;
 
-          return ListView(
-            padding: EdgeInsets.all(16),
-            children: [
-              Container(
-                padding: EdgeInsets.all(18),
-                decoration: BoxDecoration(
-                  color: Colors.green.shade700,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(Icons.store, color: Colors.white, size: 34),
-                    SizedBox(height: 12),
-                    Text(
+            return Padding(
+              padding: EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade700,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
                       storeName,
+                      textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 24,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    SizedBox(height: 6),
-                    Text(
-                      "Store profile only. Orders are currently routed directly to drivers.",
-                      style: TextStyle(color: Colors.white70, height: 1.3),
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(height: 16),
-              dashboardTile(
-                icon: Icons.badge,
-                title: "Role",
-                value: "Store account",
-                color: Colors.green,
-              ),
-              dashboardTile(
-                icon: Icons.location_on,
-                title: "Location",
-                value: address,
-                color: Colors.blue,
-              ),
-              dashboardTile(
-                icon: Icons.inventory_2,
-                title: "Order Flow",
-                value: "Store confirmation is off for launch",
-                color: Colors.orange,
-              ),
-              SizedBox(height: 8),
-              SizedBox(
-                height: 50,
-                child: ElevatedButton.icon(
-                  onPressed: updateStoreName,
-                  icon: Icon(Icons.edit),
-                  label: Text("Update Store Name"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green.shade700,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
+                  ),
+                  SizedBox(height: 16),
+                  Expanded(
+                    child: Container(
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: Colors.orange.shade300,
+                          width: 2,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.05),
+                            blurRadius: 8,
+                            offset: Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: EdgeInsets.fromLTRB(16, 15, 16, 13),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 42,
+                                  height: 42,
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withOpacity(0.12),
+                                    borderRadius: BorderRadius.circular(9),
+                                  ),
+                                  child: Icon(
+                                    Icons.inventory_2,
+                                    color: Colors.orange.shade800,
+                                    size: 23,
+                                  ),
+                                ),
+                                SizedBox(width: 12),
+                                Text(
+                                  "Incoming Orders",
+                                  style: TextStyle(
+                                    fontSize: 21,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Divider(height: 1, color: Colors.grey.shade200),
+                          Expanded(
+                            child: user == null
+                                ? Center(child: Text("Log in to view orders"))
+                                : StreamBuilder<QuerySnapshot>(
+                                    stream: FirebaseFirestore.instance
+                                        .collection('orders')
+                                        .where('storeId', isEqualTo: user.uid)
+                                        .where('status', isEqualTo: 'Pending')
+                                        .snapshots(),
+                                    builder: (context, orderSnapshot) {
+                                      if (orderSnapshot.hasError) {
+                                        return Center(
+                                          child: Padding(
+                                            padding: EdgeInsets.all(20),
+                                            child: Text(
+                                              "Could not load incoming orders.",
+                                              textAlign: TextAlign.center,
+                                              style: TextStyle(
+                                                color: Colors.grey.shade700,
+                                              ),
+                                            ),
+                                          ),
+                                        );
+                                      }
+
+                                      if (!orderSnapshot.hasData) {
+                                        return Center(
+                                          child: CircularProgressIndicator(),
+                                        );
+                                      }
+
+                                      final orders = orderSnapshot.data!.docs;
+
+                                      if (orders.isEmpty) {
+                                        return Center(
+                                          child: Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.inbox_outlined,
+                                                size: 38,
+                                                color: Colors.grey.shade400,
+                                              ),
+                                              SizedBox(height: 8),
+                                              Text(
+                                                "No incoming orders",
+                                                style: TextStyle(
+                                                  color: Colors.grey.shade600,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      }
+
+                                      return Scrollbar(
+                                        child: ListView.builder(
+                                          padding: EdgeInsets.symmetric(
+                                            vertical: 6,
+                                          ),
+                                          itemCount: orders.length,
+                                          itemBuilder: (context, index) {
+                                            final order =
+                                                orders[index].data()
+                                                    as Map<String, dynamic>;
+
+                                            return _realOrderCard(
+                                              order,
+                                              orders[index].id,
+                                              context,
+                                            );
+                                          },
+                                        ),
+                                      );
+                                    },
+                                  ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
+                ],
               ),
-              SizedBox(height: 10),
-              SizedBox(
-                height: 50,
-                child: OutlinedButton.icon(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => AddressSearchScreen()),
-                    );
-                  },
-                  icon: Icon(Icons.location_on),
-                  label: Text("Update Store Location"),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.green.shade800,
-                    side: BorderSide(color: Colors.green.shade700),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -4631,6 +7052,7 @@ class StoreInventoryScreen extends StatefulWidget {
 }
 
 class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
+  final ScrollController _partsScrollController = ScrollController();
   String selectedTrade = "All";
   String selectedCategory = "All";
   String searchText = "";
@@ -4639,46 +7061,11 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
   final List<String> trades = ["All", "Plumbing", "HVAC"];
 
   String inventoryKey(Map<String, dynamic> item) {
-    final raw = "${item['trade']}|${item['name']}";
-    return base64Url.encode(utf8.encode(raw));
+    return storeInventoryItemKey(item);
   }
 
   List<Map<String, dynamic>> inventoryParts() {
-    final plumbingParts = _PlumbingScreenState().parts.map((item) {
-      return {
-        "trade": "Plumbing",
-        "name": item["name"] ?? "Part",
-        "image": item["image"],
-        "categories": item["categories"] ?? [],
-      };
-    });
-
-    final hvacParts = _HVACScreenState().parts.map((item) {
-      return {
-        "trade": "HVAC",
-        "name": item["name"] ?? "Part",
-        "image": item["image"],
-        "categories": item["categories"] ?? [],
-      };
-    });
-
-    final seen = <String>{};
-    final combined = [...plumbingParts, ...hvacParts].where((item) {
-      final key = inventoryKey(item);
-      if (seen.contains(key)) return false;
-      seen.add(key);
-      return true;
-    }).toList();
-
-    combined.sort((a, b) {
-      final tradeCompare = a['trade'].toString().compareTo(
-        b['trade'].toString(),
-      );
-      if (tradeCompare != 0) return tradeCompare;
-      return a['name'].toString().compareTo(b['name'].toString());
-    });
-
-    return combined;
+    return storeInventoryCatalog();
   }
 
   List<String> categoryTabs(List<Map<String, dynamic>> parts) {
@@ -4788,242 +7175,260 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
   }
 
   @override
+  void dispose() {
+    _partsScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
     final allParts = inventoryParts();
 
     return Scaffold(
-      backgroundColor: Colors.grey.shade100,
       appBar: AppBar(title: Text("Inventory"), centerTitle: true),
-      body: user == null
-          ? Center(child: Text("Log in to manage inventory"))
-          : StreamBuilder<DocumentSnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection('users')
-                  .doc(user.uid)
-                  .snapshots(),
-              builder: (context, snapshot) {
-                final data = snapshot.data?.data() as Map<String, dynamic>?;
-                final inventory = Map<String, dynamic>.from(
-                  (data?['storeInventory'] as Map?) ?? {},
-                );
-                final categoryOptions = categoryTabs(allParts);
-                if (!categoryOptions.contains(selectedCategory)) {
-                  selectedCategory = "All";
-                }
-                final shownParts = filteredParts(allParts);
-                final carriedCount = inventory.values.where((entry) {
-                  return entry is Map && entry['carries'] == true;
-                }).length;
+      body: appScreenFade(
+        child: user == null
+            ? Center(child: Text("Log in to manage inventory"))
+            : StreamBuilder<DocumentSnapshot>(
+                stream: FirebaseFirestore.instance
+                    .collection('users')
+                    .doc(user.uid)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  final data = snapshot.data?.data() as Map<String, dynamic>?;
+                  final inventory = Map<String, dynamic>.from(
+                    (data?['storeInventory'] as Map?) ?? {},
+                  );
+                  final categoryOptions = categoryTabs(allParts);
+                  if (!categoryOptions.contains(selectedCategory)) {
+                    selectedCategory = "All";
+                  }
+                  final shownParts = filteredParts(allParts);
+                  final carriedCount = inventory.values.where((entry) {
+                    return entry is Map && entry['carries'] == true;
+                  }).length;
 
-                return Column(
-                  children: [
-                    Container(
-                      color: Colors.white,
-                      padding: EdgeInsets.fromLTRB(14, 12, 14, 10),
-                      child: Column(
-                        children: [
-                          TextField(
-                            decoration: InputDecoration(
-                              hintText: "Search parts",
-                              prefixIcon: Icon(Icons.search),
-                              filled: true,
-                              fillColor: Colors.grey.shade100,
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(10),
-                                borderSide: BorderSide.none,
-                              ),
-                            ),
-                            onChanged: (value) {
-                              setState(() {
-                                searchText = value;
-                              });
-                            },
-                          ),
-                          SizedBox(height: 10),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: SingleChildScrollView(
-                                  scrollDirection: Axis.horizontal,
-                                  child: Row(
-                                    children: trades.map((trade) {
-                                      final selected = selectedTrade == trade;
-                                      return Padding(
-                                        padding: EdgeInsets.only(right: 8),
-                                        child: ChoiceChip(
-                                          label: Text(trade),
-                                          selected: selected,
-                                          selectedColor: Colors.green.shade700,
-                                          labelStyle: TextStyle(
-                                            color: selected
-                                                ? Colors.white
-                                                : Colors.black87,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                          onSelected: (_) {
-                                            setState(() {
-                                              selectedTrade = trade;
-                                              selectedCategory = "All";
-                                            });
-                                          },
-                                        ),
-                                      );
-                                    }).toList(),
-                                  ),
+                  return Column(
+                    children: [
+                      Container(
+                        color: Colors.white,
+                        padding: EdgeInsets.fromLTRB(14, 12, 14, 10),
+                        child: Column(
+                          children: [
+                            TextField(
+                              decoration: InputDecoration(
+                                hintText: "Search parts",
+                                prefixIcon: Icon(Icons.search),
+                                filled: true,
+                                fillColor: Colors.grey.shade100,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: BorderSide.none,
                                 ),
                               ),
-                              Text(
-                                "$carriedCount carried",
-                                style: TextStyle(
-                                  color: Colors.grey.shade700,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
-                          SizedBox(height: 8),
-                          SizedBox(
-                            height: 44,
-                            child: ListView(
-                              scrollDirection: Axis.horizontal,
-                              children: categoryOptions.map((category) {
-                                final selected = selectedCategory == category;
-                                return Padding(
-                                  padding: EdgeInsets.only(right: 8),
-                                  child: ChoiceChip(
-                                    label: Text(
-                                      category,
-                                      style: TextStyle(
-                                        color: selected
-                                            ? Colors.white
-                                            : Colors.black87,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                    selected: selected,
-                                    selectedColor: Colors.orange,
-                                    backgroundColor: Colors.grey.shade200,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(20),
-                                    ),
-                                    onSelected: (_) {
-                                      setState(() {
-                                        selectedCategory = category;
-                                      });
-                                    },
-                                  ),
-                                );
-                              }).toList(),
+                              onChanged: (value) {
+                                setState(() {
+                                  searchText = value;
+                                });
+                              },
                             ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Expanded(
-                      child: ListView.separated(
-                        padding: EdgeInsets.all(12),
-                        itemCount: shownParts.length,
-                        separatorBuilder: (context, index) =>
-                            SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final item = shownParts[index];
-                          final key = inventoryKey(item);
-                          final saved = inventory[key];
-                          final carries =
-                              saved is Map && saved['carries'] == true;
-                          final markedNo =
-                              saved is Map && saved['carries'] == false;
-                          final categories =
-                              ((item['categories'] as List?) ?? [])
-                                  .take(2)
-                                  .join(' • ');
-
-                          return Container(
-                            padding: EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(
-                                color: carries
-                                    ? Colors.green.shade200
-                                    : markedNo
-                                    ? Colors.red.shade100
-                                    : Colors.grey.shade200,
-                              ),
-                            ),
-                            child: Row(
+                            SizedBox(height: 10),
+                            Row(
                               children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: partImage(item['image'] as String?),
-                                ),
-                                SizedBox(width: 10),
                                 Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        item['name'].toString(),
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                      SizedBox(height: 3),
-                                      Text(
-                                        "${item['trade']}${categories.isEmpty ? '' : ' • $categories'}",
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          color: Colors.grey.shade600,
-                                          fontSize: 12,
-                                        ),
-                                      ),
-                                    ],
+                                  child: SingleChildScrollView(
+                                    scrollDirection: Axis.horizontal,
+                                    child: Row(
+                                      children: trades.map((trade) {
+                                        final selected = selectedTrade == trade;
+                                        return Padding(
+                                          padding: EdgeInsets.only(right: 8),
+                                          child: ChoiceChip(
+                                            label: Text(trade),
+                                            selected: selected,
+                                            selectedColor:
+                                                Colors.green.shade700,
+                                            labelStyle: TextStyle(
+                                              color: selected
+                                                  ? Colors.white
+                                                  : Colors.black87,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                            onSelected: (_) {
+                                              setState(() {
+                                                selectedTrade = trade;
+                                                selectedCategory = "All";
+                                              });
+                                            },
+                                          ),
+                                        );
+                                      }).toList(),
+                                    ),
                                   ),
                                 ),
-                                SizedBox(width: 8),
-                                IconButton(
-                                  tooltip: "Carry item",
-                                  icon: Icon(
-                                    carries
-                                        ? Icons.check_circle
-                                        : Icons.check_circle_outline,
-                                    color: carries ? Colors.green : Colors.grey,
-                                  ),
-                                  onPressed: () => updateInventory(
-                                    item: item,
-                                    currentInventory: inventory,
-                                    carries: true,
-                                  ),
-                                ),
-                                IconButton(
-                                  tooltip: "Do not carry",
-                                  icon: Icon(
-                                    markedNo
-                                        ? Icons.cancel
-                                        : Icons.cancel_outlined,
-                                    color: markedNo ? Colors.red : Colors.grey,
-                                  ),
-                                  onPressed: () => updateInventory(
-                                    item: item,
-                                    currentInventory: inventory,
-                                    carries: false,
+                                Text(
+                                  "$carriedCount carried",
+                                  style: TextStyle(
+                                    color: Colors.grey.shade700,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
                               ],
                             ),
-                          );
-                        },
+                            SizedBox(height: 8),
+                            SizedBox(
+                              height: 44,
+                              child: ListView(
+                                scrollDirection: Axis.horizontal,
+                                children: categoryOptions.map((category) {
+                                  final selected = selectedCategory == category;
+                                  return Padding(
+                                    padding: EdgeInsets.only(right: 8),
+                                    child: ChoiceChip(
+                                      label: Text(
+                                        category,
+                                        style: TextStyle(
+                                          color: selected
+                                              ? Colors.white
+                                              : Colors.black87,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                      selected: selected,
+                                      selectedColor: Colors.orange,
+                                      backgroundColor: Colors.grey.shade200,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(20),
+                                      ),
+                                      onSelected: (_) {
+                                        setState(() {
+                                          selectedCategory = category;
+                                        });
+                                      },
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                );
-              },
-            ),
+                      Expanded(
+                        child: PartsScrollRail(
+                          controller: _partsScrollController,
+                          child: ListView.separated(
+                            controller: _partsScrollController,
+                            padding: EdgeInsets.fromLTRB(12, 12, 34, 12),
+                            itemCount: shownParts.length,
+                            separatorBuilder: (context, index) =>
+                                SizedBox(height: 8),
+                            itemBuilder: (context, index) {
+                              final item = shownParts[index];
+                              final key = inventoryKey(item);
+                              final saved = inventory[key];
+                              final carries =
+                                  saved is Map && saved['carries'] == true;
+                              final markedNo =
+                                  saved is Map && saved['carries'] == false;
+                              final categories =
+                                  ((item['categories'] as List?) ?? [])
+                                      .take(2)
+                                      .join(' • ');
+
+                              return Container(
+                                padding: EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: carries
+                                        ? Colors.green.shade200
+                                        : markedNo
+                                        ? Colors.red.shade100
+                                        : Colors.grey.shade200,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: partImage(
+                                        item['image'] as String?,
+                                      ),
+                                    ),
+                                    SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            item['name'].toString(),
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          SizedBox(height: 3),
+                                          Text(
+                                            "${item['trade']}${categories.isEmpty ? '' : ' • $categories'}",
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              color: Colors.grey.shade600,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    SizedBox(width: 8),
+                                    IconButton(
+                                      tooltip: "Carry item",
+                                      icon: Icon(
+                                        carries
+                                            ? Icons.check_circle
+                                            : Icons.check_circle_outline,
+                                        color: carries
+                                            ? Colors.green
+                                            : Colors.grey,
+                                      ),
+                                      onPressed: () => updateInventory(
+                                        item: item,
+                                        currentInventory: inventory,
+                                        carries: true,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      tooltip: "Do not carry",
+                                      icon: Icon(
+                                        markedNo
+                                            ? Icons.cancel
+                                            : Icons.cancel_outlined,
+                                        color: markedNo
+                                            ? Colors.red
+                                            : Colors.grey,
+                                      ),
+                                      onPressed: () => updateInventory(
+                                        item: item,
+                                        currentInventory: inventory,
+                                        carries: false,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+      ),
     );
   }
 }
@@ -5951,6 +8356,85 @@ class FullScreenPartImageScreen extends StatelessWidget {
 
 // 🚚 DRIVER SCREEN
 
+class _DeliveryPinDialog extends StatefulWidget {
+  @override
+  State<_DeliveryPinDialog> createState() => _DeliveryPinDialogState();
+}
+
+class _DeliveryPinDialogState extends State<_DeliveryPinDialog> {
+  final TextEditingController controller = TextEditingController();
+  String? errorText;
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  void submitPin() {
+    final pin = controller.text.trim();
+
+    if (RegExp(r'^\d{4}$').hasMatch(pin)) {
+      FocusScope.of(context).unfocus();
+      Navigator.of(context).pop(pin);
+      return;
+    }
+
+    setState(() {
+      errorText = "Enter the 4-digit PIN.";
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text("Enter Delivery PIN"),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Ask the customer for their 4-digit delivery PIN."),
+          SizedBox(height: 14),
+          TextField(
+            controller: controller,
+            autofocus: true,
+            maxLength: 4,
+            keyboardType: TextInputType.number,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+              LengthLimitingTextInputFormatter(4),
+            ],
+            onChanged: (_) {
+              if (errorText != null) {
+                setState(() {
+                  errorText = null;
+                });
+              }
+            },
+            onSubmitted: (_) => submitPin(),
+            decoration: InputDecoration(
+              labelText: "Delivery PIN",
+              border: OutlineInputBorder(),
+              counterText: "",
+              errorText: errorText,
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            FocusScope.of(context).unfocus();
+            Navigator.of(context).pop(null);
+          },
+          child: Text("Cancel"),
+        ),
+        ElevatedButton(onPressed: submitPin, child: Text("Confirm")),
+      ],
+    );
+  }
+}
+
 class DriverScreen extends StatefulWidget {
   @override
   State<DriverScreen> createState() => _DriverScreenState();
@@ -5958,6 +8442,7 @@ class DriverScreen extends StatefulWidget {
 
 class _DriverScreenState extends State<DriverScreen> {
   StreamSubscription<Position>? positionStream;
+  StreamSubscription<QuerySnapshot>? assignedOrderStatusStream;
 
   GoogleMapController? mapController;
   LatLng currentPosition = LatLng(0, 0);
@@ -5992,6 +8477,8 @@ class _DriverScreenState extends State<DriverScreen> {
 
   List<LatLng> storeRoutePoints = [];
   List<LatLng> customerRoutePoints = [];
+  final Set<String> completedDriverOrderIds = {};
+  int driverMapClearVersion = 0;
 
   DateTime? lastRouteUpdate;
   LatLng? lastRoutePosition;
@@ -6001,6 +8488,9 @@ class _DriverScreenState extends State<DriverScreen> {
 
   String? distanceText;
   String? eta;
+  final Set<String> handledCancelledOrderIds = {};
+  final List<Map<String, dynamic>> driverUpdates = [];
+  int unreadDriverUpdates = 0;
 
   bool shouldUpdateRoute(LatLng newPosition) {
     if (lastRouteUpdate == null || lastRoutePosition == null) {
@@ -6019,48 +8509,62 @@ class _DriverScreenState extends State<DriverScreen> {
     return timeDiff > 10 && distance > 30;
   }
 
+  Future<Map<String, dynamic>?> fetchDirectionsRoute({
+    required LatLng origin,
+    required LatLng destination,
+  }) async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'getDirectionsRoute',
+      );
+      final result = await callable.call({
+        "originLat": origin.latitude,
+        "originLng": origin.longitude,
+        "destinationLat": destination.latitude,
+        "destinationLng": destination.longitude,
+      });
+
+      return Map<String, dynamic>.from(result.data as Map);
+    } on FirebaseFunctionsException catch (error) {
+      print("❌ ROUTE ERROR: ${error.code} ${error.message ?? ''}");
+      return null;
+    } catch (error) {
+      print("❌ ROUTE ERROR: $error");
+      return null;
+    }
+  }
+
   Future<void> getRoute() async {
     if (isFetchingRoute) return; // 👈 prevent overlap
 
     isFetchingRoute = true;
+    final routeVersion = driverMapClearVersion;
+    final targetStoreLat = currentStoreLat;
+    final targetStoreLng = currentStoreLng;
 
     try {
-      if (currentStoreLat == null || currentStoreLng == null) return;
+      if (targetStoreLat == null || targetStoreLng == null) return;
 
-      final apiKey =
-          "AIzaSyBO3ngDiG6UqOfAXcOeZ9TJiVbbwTsOGGo"; //Web for testing change later
+      final route = await fetchDirectionsRoute(
+        origin: currentPosition,
+        destination: LatLng(targetStoreLat, targetStoreLng),
+      );
 
-      final url =
-          "https://maps.googleapis.com/maps/api/directions/json?"
-          "origin=${currentPosition.latitude},${currentPosition.longitude}"
-          "&destination=$currentStoreLat,$currentStoreLng"
-          "&key=$apiKey";
-
-      final response = await http.get(Uri.parse(url));
-      final data = jsonDecode(response.body);
-      final status = data['status'];
-
-      if (status != "OK") {
-        print("❌ ROUTE ERROR: $status ${data['error_message'] ?? ''}");
+      if (route == null) {
         return;
       }
 
-      final routes = data['routes'] as List?;
-      if (routes == null || routes.isEmpty) {
-        print("❌ ROUTE ERROR: Google returned no routes");
-        return;
-      }
-
-      final leg = routes[0]['legs'][0];
-
-      final distance = leg['distance']['text']; // "5.2 mi"
-      final duration = leg['duration']['text']; // "12 mins"
-      print("📦 ROUTE DATA: ${data['routes'][0]['legs'][0]}");
-
-      final points = routes[0]['overview_polyline']['points'];
+      final distance = route['distanceText']?.toString() ?? "";
+      final duration = route['durationText']?.toString() ?? "";
+      final points = route['polyline']?.toString() ?? "";
       final decoded = decodePolyline(points);
 
       if (!mounted) return;
+      if (routeVersion != driverMapClearVersion) return;
+      if (currentStoreLat != targetStoreLat ||
+          currentStoreLng != targetStoreLng) {
+        return;
+      }
 
       setState(() {
         storeRoutePoints = decoded;
@@ -6082,57 +8586,27 @@ class _DriverScreenState extends State<DriverScreen> {
         previewCustomerLng == null)
       return;
 
-    final apiKey = "AIzaSyAekQ_K5c2zzW_wmDxZySFehntN1v2YVhU";
-
     try {
-      // 🔹 DRIVER → STORE
-      final url1 =
-          "https://maps.googleapis.com/maps/api/directions/json?"
-          "origin=${currentPosition.latitude},${currentPosition.longitude}"
-          "&destination=$previewStoreLat,$previewStoreLng"
-          "&key=$apiKey";
+      final routeToStore = await fetchDirectionsRoute(
+        origin: currentPosition,
+        destination: LatLng(previewStoreLat!, previewStoreLng!),
+      );
+      final routeToCustomer = await fetchDirectionsRoute(
+        origin: LatLng(previewStoreLat!, previewStoreLng!),
+        destination: LatLng(previewCustomerLat!, previewCustomerLng!),
+      );
 
-      // 🔹 STORE → CUSTOMER
-      final url2 =
-          "https://maps.googleapis.com/maps/api/directions/json?"
-          "origin=$previewStoreLat,$previewStoreLng"
-          "&destination=$previewCustomerLat,$previewCustomerLng"
-          "&key=$apiKey";
-
-      final res1 = await http.get(Uri.parse(url1));
-      final res2 = await http.get(Uri.parse(url2));
-
-      final data1 = jsonDecode(res1.body);
-      final data2 = jsonDecode(res2.body);
-      final status1 = data1['status'];
-      final status2 = data2['status'];
-
-      if (status1 != "OK" || status2 != "OK") {
-        print(
-          "❌ PREVIEW ROUTE ERROR: toStore=$status1 ${data1['error_message'] ?? ''} | toCustomer=$status2 ${data2['error_message'] ?? ''}",
-        );
+      if (routeToStore == null || routeToCustomer == null) {
         return;
       }
 
-      final routes1 = data1['routes'] as List?;
-      final routes2 = data2['routes'] as List?;
+      final distance1 = (routeToStore['distanceMeters'] as num?)?.toInt() ?? 0;
+      final distance2 =
+          (routeToCustomer['distanceMeters'] as num?)?.toInt() ?? 0;
 
-      if (routes1 == null ||
-          routes1.isEmpty ||
-          routes2 == null ||
-          routes2.isEmpty) {
-        print("❌ PREVIEW ROUTE ERROR: Google returned no routes");
-        return;
-      }
-
-      final leg1 = routes1[0]['legs'][0];
-      final leg2 = routes2[0]['legs'][0];
-
-      final distance1 = leg1['distance']['value']; // meters
-      final distance2 = leg2['distance']['value'];
-
-      final duration1 = leg1['duration']['value']; // seconds
-      final duration2 = leg2['duration']['value'];
+      final duration1 = (routeToStore['durationSeconds'] as num?)?.toInt() ?? 0;
+      final duration2 =
+          (routeToCustomer['durationSeconds'] as num?)?.toInt() ?? 0;
 
       final totalDistanceMeters = distance1 + distance2;
       final totalDurationSeconds = duration1 + duration2;
@@ -6141,8 +8615,8 @@ class _DriverScreenState extends State<DriverScreen> {
 
       final durationMinutes = (totalDurationSeconds / 60).round();
 
-      final points1 = routes1[0]['overview_polyline']['points'];
-      final points2 = routes2[0]['overview_polyline']['points'];
+      final points1 = routeToStore['polyline']?.toString() ?? "";
+      final points2 = routeToCustomer['polyline']?.toString() ?? "";
 
       final decoded1 = decodePolyline(points1);
       final decoded2 = decodePolyline(points2);
@@ -6331,8 +8805,254 @@ class _DriverScreenState extends State<DriverScreen> {
     previewCustomerLat = null;
     previewCustomerLng = null;
 
+    loadInitialDriverLocation();
     loadDriverStatus();
+    listenForDriverOrderCancellations();
     startTracking();
+  }
+
+  void listenForDriverOrderCancellations() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    assignedOrderStatusStream = FirebaseFirestore.instance
+        .collection('orders')
+        .where("driverId", isEqualTo: user.uid)
+        .where("status", isEqualTo: "Customer Cancelled")
+        .snapshots()
+        .listen((snapshot) {
+          for (final change in snapshot.docChanges) {
+            if (change.type == DocumentChangeType.removed) continue;
+
+            final orderId = change.doc.id;
+            if (handledCancelledOrderIds.contains(orderId)) continue;
+
+            final isCurrentDriverOrder =
+                isOnActiveDelivery ||
+                isPreviewingOrder ||
+                previewOrderId == orderId ||
+                currentStoreLat != null ||
+                currentStoreLng != null;
+
+            if (!isCurrentDriverOrder) continue;
+
+            handledCancelledOrderIds.add(orderId);
+            handleDriverOrderCancelled(orderId: orderId);
+          }
+        });
+  }
+
+  void handleDriverOrderCancelled({String? orderId}) {
+    if (!mounted) return;
+
+    setState(() {
+      if (orderId != null) {
+        completedDriverOrderIds.add(orderId);
+      }
+
+      addDriverUpdate(
+        title: "Order cancelled",
+        message: "The customer cancelled the order.",
+        icon: Icons.cancel,
+        color: Colors.red,
+      );
+
+      clearDriverOrderMapState();
+      isUpdatingStatus = false;
+    });
+
+    locationTimer?.cancel();
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          duration: Duration(seconds: 4),
+          backgroundColor: Colors.grey.shade800,
+          content: Text(
+            "Order cancelled by customer.",
+            style: TextStyle(color: Colors.white),
+          ),
+        ),
+      );
+  }
+
+  void clearDriverOrderMapState() {
+    driverMapClearVersion++;
+    previewOrderId = null;
+    previewStoreLat = null;
+    previewStoreLng = null;
+    previewCustomerLat = null;
+    previewCustomerLng = null;
+    previewDistance = null;
+    previewDuration = null;
+
+    currentStoreLat = null;
+    currentStoreLng = null;
+
+    isPreviewingOrder = false;
+    isOnActiveDelivery = false;
+    isPickedUp = false;
+    routeLoaded = false;
+    isFetchingRoute = false;
+
+    storeRoutePoints = [];
+    customerRoutePoints = [];
+    polylines = {};
+    customerRouteOpacity = 1.0;
+    distanceText = null;
+    eta = null;
+  }
+
+  void addDriverUpdate({
+    required String title,
+    required String message,
+    required IconData icon,
+    required Color color,
+  }) {
+    driverUpdates.insert(0, {
+      "title": title,
+      "message": message,
+      "icon": icon,
+      "color": color,
+      "createdAt": DateTime.now(),
+    });
+
+    unreadDriverUpdates += 1;
+  }
+
+  void openDriverUpdates() {
+    setState(() {
+      unreadDriverUpdates = 0;
+    });
+
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "Driver Updates",
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 12),
+                if (driverUpdates.isEmpty)
+                  Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Center(
+                      child: Text(
+                        "No updates yet",
+                        style: TextStyle(color: Colors.grey.shade600),
+                      ),
+                    ),
+                  )
+                else
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.of(context).size.height * 0.45,
+                    ),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: driverUpdates.length,
+                      separatorBuilder: (context, index) => Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final update = driverUpdates[index];
+                        final createdAt = update["createdAt"] as DateTime;
+
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                            backgroundColor: (update["color"] as Color)
+                                .withOpacity(0.12),
+                            child: Icon(
+                              update["icon"] as IconData,
+                              color: update["color"] as Color,
+                            ),
+                          ),
+                          title: Text(
+                            update["title"] as String,
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          subtitle: Text(update["message"] as String),
+                          trailing: Text(
+                            "${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}",
+                            style: TextStyle(
+                              color: Colors.grey.shade600,
+                              fontSize: 12,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget driverNotificationBell() {
+    return Padding(
+      padding: EdgeInsets.only(right: 8),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          IconButton(
+            tooltip: "Driver updates",
+            icon: Icon(Icons.notifications_outlined),
+            onPressed: openDriverUpdates,
+          ),
+          if (unreadDriverUpdates > 0)
+            Positioned(
+              right: 7,
+              top: 7,
+              child: Container(
+                padding: EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white, width: 1.5),
+                ),
+                constraints: BoxConstraints(minWidth: 18),
+                child: Text(
+                  unreadDriverUpdates > 9 ? "9+" : "$unreadDriverUpdates",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> loadInitialDriverLocation() async {
+    final position = await requestLocation();
+    if (position == null || !mounted) return;
+
+    final driverPosition = LatLng(position.latitude, position.longitude);
+
+    setState(() {
+      currentPosition = driverPosition;
+    });
+
+    mapController?.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: driverPosition, zoom: 16),
+      ),
+    );
   }
 
   Future<void> resetDriverBusyIfNoActiveOrder() async {
@@ -6340,26 +9060,29 @@ class _DriverScreenState extends State<DriverScreen> {
 
     if (user == null) return;
 
-    final activeOrders = await FirebaseFirestore.instance
-        .collection('orders')
-        .where("driverId", isEqualTo: user.uid)
-        .where("status", whereIn: ["Accepted", "Picked Up"])
-        .get();
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'syncDriverAvailability',
+      );
+      final result = await callable.call();
+      final data = Map<String, dynamic>.from(result.data as Map);
 
-    if (activeOrders.docs.isEmpty) {
-      await FirebaseFirestore.instance.collection('drivers').doc(user.uid).set({
-        "isBusy": false,
-      }, SetOptions(merge: true));
-
-      print("✅ No active orders — Driver marked available");
-    } else {
-      print("🚗 Active order found — Driver remains busy");
+      if (data["isBusy"] == true) {
+        print("🚗 Active order found — Driver remains busy");
+      } else {
+        print("✅ No active orders — Driver marked available");
+      }
+    } on FirebaseFunctionsException catch (error) {
+      print("❌ DRIVER AVAILABILITY SYNC ERROR: ${error.message}");
+    } catch (error) {
+      print("❌ DRIVER AVAILABILITY SYNC ERROR: $error");
     }
   }
 
   @override
   void dispose() {
     positionStream?.cancel();
+    assignedOrderStatusStream?.cancel();
     _scrollController.dispose();
     super.dispose();
   }
@@ -6377,15 +9100,195 @@ class _DriverScreenState extends State<DriverScreen> {
     if (!doc.exists) return;
 
     final data = doc.data();
+    final savedLat = (data?["lat"] as num?)?.toDouble();
+    final savedLng = (data?["lng"] as num?)?.toDouble();
+    final hasCurrentLocation =
+        currentPosition.latitude != 0 || currentPosition.longitude != 0;
+    final hasSavedLocation =
+        savedLat != null &&
+        savedLng != null &&
+        savedLat.isFinite &&
+        savedLng.isFinite &&
+        (savedLat != 0 || savedLng != 0);
 
     setState(() {
       isOnline = data?["active"] ?? false;
+
+      if (!hasCurrentLocation && hasSavedLocation) {
+        currentPosition = LatLng(savedLat, savedLng);
+      }
     });
+
+    if (isOnline) {
+      await refreshDriverAvailableOrders();
+    }
+  }
+
+  Future<void> refreshDriverAvailableOrders() async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'refreshDriverAvailableOrders',
+      );
+      await callable.call();
+    } catch (error) {
+      debugPrint("Could not refresh driver delivery requests: $error");
+    }
+  }
+
+  Future<void> updateOnlineStatus(bool value) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    if (isUpdatingStatus) return;
+
+    setState(() {
+      isUpdatingStatus = true;
+    });
+
+    try {
+      if (value) {
+        final payoutsReady = await ensureDriverPayoutsReady();
+        if (!payoutsReady) return;
+      }
+
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'updateDriverOnlineStatus',
+      );
+      await callable.call({"active": value});
+
+      if (value) {
+        await refreshDriverAvailableOrders();
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        isOnline = value;
+
+        if (!isOnline) {
+          previewOrderId = null;
+          isPreviewingOrder = false;
+        }
+      });
+    } on FirebaseFunctionsException catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: Duration(seconds: 4),
+            backgroundColor: Colors.grey.shade800,
+            content: Text(
+              error.message ?? "Could not update driver status.",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: Duration(seconds: 4),
+            backgroundColor: Colors.grey.shade800,
+            content: Text(
+              "Could not update driver status. Please try again.",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+    } finally {
+      if (mounted) {
+        setState(() {
+          isUpdatingStatus = false;
+        });
+      }
+    }
+  }
+
+  Future<bool> ensureDriverPayoutsReady() async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'getDriverPayoutStatus',
+      );
+      final result = await callable.call();
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final ready = data["ready"] == true;
+
+      if (ready) return true;
+
+      if (!mounted) return false;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: Duration(seconds: 6),
+            backgroundColor: Colors.grey.shade800,
+            content: Text(
+              "Set up Stripe payouts before going online.",
+              style: TextStyle(color: Colors.white),
+            ),
+            action: SnackBarAction(
+              label: "SET UP",
+              textColor: Colors.orange.shade200,
+              onPressed: openDriverPayoutSetup,
+            ),
+          ),
+        );
+
+      return false;
+    } catch (error) {
+      if (!mounted) return false;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: Duration(seconds: 4),
+            backgroundColor: Colors.grey.shade800,
+            content: Text(
+              "Could not check payout setup. Please try again.",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+
+      return false;
+    }
+  }
+
+  Future<void> openDriverPayoutSetup() async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'createDriverDashboardLink',
+      );
+
+      final result = await callable.call();
+      final url = result.data['url'];
+
+      if (url == null) {
+        throw Exception("No Stripe link returned");
+      }
+
+      final uri = Uri.parse(url);
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text("Could not open Stripe payout setup")),
+        );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final currentUser = FirebaseAuth.instance.currentUser;
     debugPrint("🔥 isPreviewingOrder: $isPreviewingOrder");
     return Scaffold(
       appBar: AppBar(
@@ -6401,27 +9304,7 @@ class _DriverScreenState extends State<DriverScreen> {
             Switch(
               value: isOnline,
               activeColor: Colors.green,
-              onChanged: (value) async {
-                final user = FirebaseAuth.instance.currentUser;
-
-                setState(() {
-                  isOnline = value;
-
-                  if (!isOnline) {
-                    // 🔥 CLEAR ORDER UI STATE
-                    previewOrderId = null;
-                    isPreviewingOrder = false;
-                  }
-                });
-
-                await FirebaseFirestore.instance
-                    .collection('drivers')
-                    .doc(user!.uid)
-                    .set({
-                      "active": isOnline,
-                      "lastOnlineUpdate": FieldValue.serverTimestamp(),
-                    }, SetOptions(merge: true));
-              },
+              onChanged: isUpdatingStatus ? null : updateOnlineStatus,
             ),
           ],
         ),
@@ -6435,65 +9318,29 @@ class _DriverScreenState extends State<DriverScreen> {
           ),
         ),
 
-        actions: [
-          Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: GestureDetector(
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => DriverEarningsScreen()),
-                );
-              },
-              child: Container(
-                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: Colors.black,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-
-                // 🔥 LIVE EARNINGS
-                child: StreamBuilder<DocumentSnapshot>(
-                  stream: FirebaseFirestore.instance
-                      .collection('drivers')
-                      .doc(FirebaseAuth.instance.currentUser!.uid)
-                      .snapshots(),
-                  builder: (context, snapshot) {
-                    if (!snapshot.hasData) {
-                      return Text(
-                        "\$0.00",
-                        style: TextStyle(color: Colors.white),
-                      );
-                    }
-
-                    final data = snapshot.data!.data() as Map<String, dynamic>?;
-
-                    final earnings = (data?['earnings'] ?? 0).toDouble();
-
-                    return Text(
-                      "\$${earnings.toStringAsFixed(2)}",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ),
-          ),
-        ],
+        actions: [driverNotificationBell()],
       ),
       drawer: Drawer(
         child: ListView(
           padding: EdgeInsets.zero,
           children: [
-            // 🔵 HEADER
-            DrawerHeader(
-              decoration: BoxDecoration(color: Colors.blue),
+            Container(
+              height: MediaQuery.paddingOf(context).top + kToolbarHeight,
+              padding: EdgeInsets.fromLTRB(
+                20,
+                MediaQuery.paddingOf(context).top,
+                16,
+                0,
+              ),
+              color: Colors.orange,
+              alignment: Alignment.centerLeft,
               child: Text(
                 "Driver Menu",
-                style: TextStyle(color: Colors.white, fontSize: 18),
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
 
@@ -6532,14 +9379,29 @@ class _DriverScreenState extends State<DriverScreen> {
               "driverId",
               isEqualTo: FirebaseAuth.instance.currentUser!.uid,
             )
-            .where("status", whereIn: ["Accepted", "Picked Up"])
+            .where("status", whereIn: ["Accepted", "Picked Up", "Store Issue"])
             .snapshots(),
         builder: (context, activeSnapshot) {
-          if (!activeSnapshot.hasData) return SizedBox();
+          if (!activeSnapshot.hasData) {
+            return Column(
+              children: [
+                Container(
+                  height: 1,
+                  width: double.infinity,
+                  color: Colors.grey.shade300,
+                ),
+                Expanded(child: _buildDriverMap()),
+              ],
+            );
+          }
 
-          final activeOrders = activeSnapshot.data?.docs ?? [];
+          final activeOrders = (activeSnapshot.data?.docs ?? [])
+              .where((doc) => !completedDriverOrderIds.contains(doc.id))
+              .toList();
 
           final hasActiveOrder = activeOrders.isNotEmpty;
+          final hasDriverLocation =
+              currentPosition.latitude != 0 || currentPosition.longitude != 0;
 
           return Column(
             children: [
@@ -6548,505 +9410,1013 @@ class _DriverScreenState extends State<DriverScreen> {
                 width: double.infinity,
                 color: Colors.grey.shade300,
               ),
-              // 🟢 ACTIVE DELIVERY
-              if (hasActiveOrder)
-                Builder(
-                  builder: (context) {
-                    final orderDoc = activeOrders.first;
-                    final order = orderDoc.data() as Map<String, dynamic>;
-                    final storeLat = (order['storeLat'] as num?)?.toDouble();
-                    final storeLng = (order['storeLng'] as num?)?.toDouble();
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.42,
+                ),
+                child: ClipRect(
+                  child: AnimatedSize(
+                    duration: Duration(milliseconds: 450),
+                    curve: Curves.easeInOutCubic,
+                    alignment: Alignment.topCenter,
+                    child: AnimatedSwitcher(
+                      duration: Duration(milliseconds: 400),
+                      reverseDuration: Duration(milliseconds: 300),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      layoutBuilder: (currentChild, previousChildren) {
+                        return Stack(
+                          alignment: Alignment.topCenter,
+                          children: [
+                            ...previousChildren,
+                            if (currentChild != null) currentChild,
+                          ],
+                        );
+                      },
+                      transitionBuilder: (child, animation) {
+                        final curvedAnimation = CurvedAnimation(
+                          parent: animation,
+                          curve: Curves.easeOutCubic,
+                          reverseCurve: Curves.easeInCubic,
+                        );
 
-                    if (storeLat != null && storeLng != null) {
-                      final storeChanged =
-                          currentStoreLat != storeLat ||
-                          currentStoreLng != storeLng;
-
-                      currentStoreLat = storeLat;
-                      currentStoreLng = storeLng;
-
-                      if ((storeChanged || storeRoutePoints.isEmpty) &&
-                          !isFetchingRoute) {
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          if (mounted) {
-                            getRoute();
-                          }
-                        });
-                      }
-                    }
-
-                    final status = order['status'];
-
-                    final customerName = order['customerName'] ?? "Customer";
-                    final storeName = order['storeName'] ?? "Store";
-                    final items = order['items'] as List? ?? [];
-
-                    int totalQuantity = 0;
-
-                    for (var item in items) {
-                      totalQuantity += (item['quantity'] ?? 1) as int;
-                    }
-
-                    return Align(
-                      alignment: Alignment.centerLeft,
-                      child: GestureDetector(
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => DriverOrderDetailsScreen(
-                                order: order,
-                                orderId: orderDoc.id,
-                              ),
-                            ),
-                          );
-                        },
-                        child: Container(
-                          width: double.infinity,
-                          padding: EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: Color(0xFFE8F5E9),
-                            borderRadius: BorderRadius.circular(12),
+                        return FadeTransition(
+                          opacity: curvedAnimation,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: Offset(0, 0.06),
+                              end: Offset.zero,
+                            ).animate(curvedAnimation),
+                            child: child,
                           ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                "Active Delivery at $storeName",
-                                style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 16,
-                                ),
+                        );
+                      },
+                      child: hasActiveOrder
+                          ? Builder(
+                              key: ValueKey(
+                                "active-delivery-${activeOrders.first.id}",
                               ),
-                              Text(
-                                "$customerName's Order: \$${((order['total'] ?? 0) as num).toDouble().toStringAsFixed(2)}",
-                                style: TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              Text("$totalQuantity items"),
-                              SizedBox(height: 4),
-                              Row(
-                                children: [
-                                  Icon(
-                                    Icons.touch_app,
-                                    size: 16,
-                                    color: Colors.green[800],
-                                  ),
-                                  SizedBox(width: 4),
-                                  Text(
-                                    "Tap to view parts",
-                                    style: TextStyle(
-                                      color: Colors.green[800],
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              SizedBox(height: 10),
+                              builder: (context) {
+                                final orderDoc = activeOrders.first;
+                                final order =
+                                    orderDoc.data() as Map<String, dynamic>;
+                                final storeLat = (order['storeLat'] as num?)
+                                    ?.toDouble();
+                                final storeLng = (order['storeLng'] as num?)
+                                    ?.toDouble();
 
-                              if (distanceText != null && eta != null)
-                                Padding(
-                                  padding: EdgeInsets.only(top: 6),
-                                  child: Text(
-                                    "$distanceText • $eta",
-                                    style: TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.green[800],
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                ),
-                              Row(
-                                children: [
-                                  // ✅ GREEN BUTTON
-                                  Expanded(
-                                    child: ElevatedButton(
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: Colors.green,
+                                if (storeLat != null && storeLng != null) {
+                                  final storeChanged =
+                                      currentStoreLat != storeLat ||
+                                      currentStoreLng != storeLng;
+
+                                  currentStoreLat = storeLat;
+                                  currentStoreLng = storeLng;
+
+                                  if ((storeChanged ||
+                                          storeRoutePoints.isEmpty) &&
+                                      !isFetchingRoute) {
+                                    WidgetsBinding.instance
+                                        .addPostFrameCallback((_) {
+                                          if (mounted) {
+                                            getRoute();
+                                          }
+                                        });
+                                  }
+                                }
+
+                                final status = order['status'];
+                                final isWaitingForCustomer =
+                                    status == "Store Issue";
+                                final hasPickupProof =
+                                    (order['pickupProofPhotoUrl'] ?? "")
+                                        .toString()
+                                        .isNotEmpty;
+
+                                final customerName =
+                                    order['customerName'] ?? "Customer";
+                                final storeName = order['storeName'] ?? "Store";
+                                final tradeType = order['tradeType'] ?? "Trade";
+                                final items = order['items'] as List? ?? [];
+                                final total = ((order['total'] ?? 0) as num)
+                                    .toDouble();
+
+                                int totalQuantity = 0;
+
+                                for (var item in items) {
+                                  totalQuantity +=
+                                      (item['quantity'] ?? 1) as int;
+                                }
+
+                                void openActiveOrderDetails() {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => DriverOrderDetailsScreen(
+                                        order: order,
+                                        orderId: orderDoc.id,
                                       ),
-                                      onPressed: isUpdatingStatus
-                                          ? null
-                                          : () async {
-                                              setState(
-                                                () => isUpdatingStatus = true,
-                                              );
+                                    ),
+                                  );
+                                }
 
-                                              startLocationUpdates();
-
-                                              final freshDoc =
-                                                  await FirebaseFirestore
-                                                      .instance
-                                                      .collection('orders')
-                                                      .doc(orderDoc.id)
-                                                      .get();
-
-                                              final freshData =
-                                                  freshDoc.data()
-                                                      as Map<String, dynamic>;
-                                              final currentStatus =
-                                                  freshData['status'];
-
-                                              String newStatus;
-
-                                              if (currentStatus == "Accepted") {
-                                                final pickupStoreLat =
-                                                    (freshData['storeLat']
-                                                            as num?)
-                                                        ?.toDouble();
-                                                final pickupStoreLng =
-                                                    (freshData['storeLng']
-                                                            as num?)
-                                                        ?.toDouble();
-
-                                                if (pickupStoreLat == null ||
-                                                    pickupStoreLng == null) {
-                                                  ScaffoldMessenger.of(
-                                                    context,
-                                                  ).showSnackBar(
-                                                    SnackBar(
-                                                      content: Text(
-                                                        "Store location is unavailable for this order.",
+                                return GestureDetector(
+                                  onTap: openActiveOrderDetails,
+                                  child: Container(
+                                    width: double.infinity,
+                                    margin: EdgeInsets.fromLTRB(10, 10, 10, 8),
+                                    padding: EdgeInsets.all(12),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                        color: Colors.green.shade600,
+                                        width: 2,
+                                      ),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(0.08),
+                                          blurRadius: 8,
+                                          offset: Offset(0, 3),
+                                        ),
+                                      ],
+                                    ),
+                                    child: SingleChildScrollView(
+                                      physics: BouncingScrollPhysics(),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Expanded(
+                                                child: Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      storeName,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                        fontSize: 16,
                                                       ),
                                                     ),
-                                                  );
-                                                  setState(
-                                                    () => isUpdatingStatus =
-                                                        false,
-                                                  );
-                                                  return;
-                                                }
-
-                                                final markedPickedUp =
-                                                    await markOrderPickedUp(
-                                                      orderId: orderDoc.id,
-                                                      storeLat: pickupStoreLat,
-                                                      storeLng: pickupStoreLng,
-                                                    );
-
-                                                if (markedPickedUp) {
-                                                  setState(() {
-                                                    isPickedUp = true;
-                                                  });
-                                                  switchToCustomerRoute();
-                                                }
-
-                                                if (mounted) {
-                                                  setState(
-                                                    () => isUpdatingStatus =
-                                                        false,
-                                                  );
-                                                }
-                                                return;
-                                              } else if (currentStatus ==
-                                                  "Picked Up") {
-                                                newStatus = "Delivered";
-                                              } else {
-                                                setState(
-                                                  () =>
-                                                      isUpdatingStatus = false,
-                                                );
-                                                return;
-                                              }
-
-                                              if (newStatus == "Delivered") {
-                                                final driverId = FirebaseAuth
-                                                    .instance
-                                                    .currentUser!
-                                                    .uid;
-                                                final driverPay = 12.00;
-
-                                                await FirebaseFirestore.instance
-                                                    .collection('orders')
-                                                    .doc(orderDoc.id)
-                                                    .update({
-                                                      "status": "Delivered",
-                                                      "driverPay": driverPay,
-                                                      "createdAt":
-                                                          FieldValue.serverTimestamp(),
-                                                    });
-
-                                                await FirebaseFirestore.instance
-                                                    .collection('drivers')
-                                                    .doc(driverId)
-                                                    .update({
-                                                      "earnings":
-                                                          FieldValue.increment(
-                                                            driverPay,
+                                                    SizedBox(height: 4),
+                                                    Text(
+                                                      customerName,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        color: Colors
+                                                            .grey
+                                                            .shade700,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                              SizedBox(width: 8),
+                                              Container(
+                                                padding: EdgeInsets.symmetric(
+                                                  horizontal: 9,
+                                                  vertical: 5,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.green
+                                                      .withOpacity(0.1),
+                                                  borderRadius:
+                                                      BorderRadius.circular(20),
+                                                ),
+                                                child: Text(
+                                                  tradeType,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    color:
+                                                        Colors.green.shade800,
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          SizedBox(height: 8),
+                                          Row(
+                                            children: [
+                                              _smallDriverStat(
+                                                Icons.inventory_2,
+                                                "$totalQuantity items",
+                                              ),
+                                              SizedBox(width: 8),
+                                              _smallDriverStat(
+                                                Icons.attach_money,
+                                                total.toStringAsFixed(2),
+                                              ),
+                                            ],
+                                          ),
+                                          SizedBox(height: 8),
+                                          Row(
+                                            children: [
+                                              Flexible(
+                                                child: Container(
+                                                  padding: EdgeInsets.symmetric(
+                                                    horizontal: 8,
+                                                    vertical: 4,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color: isWaitingForCustomer
+                                                        ? Colors.deepOrange
+                                                              .withOpacity(0.1)
+                                                        : Colors.green
+                                                              .withOpacity(0.1),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          20,
+                                                        ),
+                                                  ),
+                                                  child: Row(
+                                                    mainAxisSize:
+                                                        MainAxisSize.min,
+                                                    children: [
+                                                      Icon(
+                                                        isWaitingForCustomer
+                                                            ? Icons
+                                                                  .hourglass_top
+                                                            : Icons
+                                                                  .local_shipping,
+                                                        size: 15,
+                                                        color:
+                                                            isWaitingForCustomer
+                                                            ? Colors
+                                                                  .deepOrange
+                                                                  .shade800
+                                                            : Colors
+                                                                  .green
+                                                                  .shade800,
+                                                      ),
+                                                      SizedBox(width: 5),
+                                                      Flexible(
+                                                        child: Text(
+                                                          isWaitingForCustomer
+                                                              ? "Waiting for customer"
+                                                              : "Active Delivery",
+                                                          maxLines: 1,
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                          style: TextStyle(
+                                                            color:
+                                                                isWaitingForCustomer
+                                                                ? Colors
+                                                                      .deepOrange
+                                                                      .shade800
+                                                                : Colors
+                                                                      .green
+                                                                      .shade800,
+                                                            fontWeight:
+                                                                FontWeight.bold,
+                                                            fontSize: 12,
                                                           ),
-                                                      "isBusy": false,
-                                                    });
-                                              }
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                              SizedBox(width: 8),
+                                              TextButton.icon(
+                                                onPressed:
+                                                    openActiveOrderDetails,
+                                                icon: Icon(
+                                                  Icons.inventory_2,
+                                                  size: 16,
+                                                ),
+                                                label: Text("View parts"),
+                                                style: TextButton.styleFrom(
+                                                  minimumSize: Size(0, 34),
+                                                  padding: EdgeInsets.symmetric(
+                                                    horizontal: 8,
+                                                  ),
+                                                  tapTargetSize:
+                                                      MaterialTapTargetSize
+                                                          .shrinkWrap,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
 
-                                              if (newStatus == "Delivered") {
-                                                setState(() {
-                                                  isPickedUp = false;
-                                                  isOnActiveDelivery = false;
-                                                  isPreviewingOrder = false;
+                                          if (distanceText != null &&
+                                              eta != null)
+                                            Padding(
+                                              padding: EdgeInsets.only(top: 12),
+                                              child: Row(
+                                                children: [
+                                                  Icon(
+                                                    Icons.route,
+                                                    size: 16,
+                                                    color:
+                                                        Colors.green.shade700,
+                                                  ),
+                                                  SizedBox(width: 5),
+                                                  Text(
+                                                    "$distanceText • $eta",
+                                                    style: TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      color:
+                                                          Colors.green.shade700,
+                                                      fontSize: 14,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          SizedBox(height: 12),
+                                          if (isWaitingForCustomer) ...[
+                                            Container(
+                                              width: double.infinity,
+                                              padding: EdgeInsets.all(10),
+                                              decoration: BoxDecoration(
+                                                color: Colors.deepOrange
+                                                    .withOpacity(0.08),
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                                border: Border.all(
+                                                  color: Colors
+                                                      .deepOrange
+                                                      .shade200,
+                                                ),
+                                              ),
+                                              child: Text(
+                                                "Customer notified. If they choose another nearby store, this order will update here.",
+                                                style: TextStyle(
+                                                  color: Colors
+                                                      .deepOrange
+                                                      .shade900,
+                                                  fontWeight: FontWeight.w600,
+                                                  fontSize: 12,
+                                                ),
+                                              ),
+                                            ),
+                                            SizedBox(height: 12),
+                                          ],
+                                          Row(
+                                            children: [
+                                              // ✅ GREEN BUTTON
+                                              Expanded(
+                                                child: ElevatedButton(
+                                                  style: ElevatedButton.styleFrom(
+                                                    backgroundColor:
+                                                        isWaitingForCustomer
+                                                        ? Colors.grey.shade400
+                                                        : Colors.green.shade700,
+                                                    foregroundColor:
+                                                        Colors.white,
+                                                    minimumSize:
+                                                        Size.fromHeight(44),
+                                                    shape: RoundedRectangleBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            8,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                  onPressed:
+                                                      isUpdatingStatus ||
+                                                          isWaitingForCustomer
+                                                      ? null
+                                                      : () async {
+                                                          setState(
+                                                            () =>
+                                                                isUpdatingStatus =
+                                                                    true,
+                                                          );
 
-                                                  storeRoutePoints = [];
-                                                  customerRoutePoints = [];
+                                                          startLocationUpdates();
 
-                                                  currentStoreLat = null;
-                                                  currentStoreLng = null;
-                                                  previewStoreLat = null;
-                                                  previewStoreLng = null;
+                                                          final freshDoc =
+                                                              await FirebaseFirestore
+                                                                  .instance
+                                                                  .collection(
+                                                                    'orders',
+                                                                  )
+                                                                  .doc(
+                                                                    orderDoc.id,
+                                                                  )
+                                                                  .get();
 
-                                                  customerRouteOpacity = 1.0;
+                                                          final freshData =
+                                                              freshDoc.data()
+                                                                  as Map<
+                                                                    String,
+                                                                    dynamic
+                                                                  >;
+                                                          final currentStatus =
+                                                              freshData['status'];
 
-                                                  distanceText = null;
-                                                  eta = null;
-                                                });
+                                                          String newStatus;
 
-                                                locationTimer?.cancel();
-                                              }
+                                                          if (currentStatus ==
+                                                              "Accepted") {
+                                                            final pickupStoreLat =
+                                                                (freshData['storeLat']
+                                                                        as num?)
+                                                                    ?.toDouble();
+                                                            final pickupStoreLng =
+                                                                (freshData['storeLng']
+                                                                        as num?)
+                                                                    ?.toDouble();
 
-                                              setState(
-                                                () => isUpdatingStatus = false,
-                                              );
-                                            },
-                                      child: Text(
-                                        status == "Accepted"
-                                            ? "Mark Picked Up"
-                                            : status == "Picked Up"
-                                            ? "Mark Delivered"
-                                            : "",
+                                                            if (pickupStoreLat ==
+                                                                    null ||
+                                                                pickupStoreLng ==
+                                                                    null) {
+                                                              ScaffoldMessenger.of(
+                                                                context,
+                                                              ).showSnackBar(
+                                                                SnackBar(
+                                                                  content: Text(
+                                                                    "Store location is unavailable for this order.",
+                                                                  ),
+                                                                ),
+                                                              );
+                                                              setState(
+                                                                () =>
+                                                                    isUpdatingStatus =
+                                                                        false,
+                                                              );
+                                                              return;
+                                                            }
+
+                                                            final markedPickedUp =
+                                                                await markOrderPickedUp(
+                                                                  orderId:
+                                                                      orderDoc
+                                                                          .id,
+                                                                  storeLat:
+                                                                      pickupStoreLat,
+                                                                  storeLng:
+                                                                      pickupStoreLng,
+                                                                );
+
+                                                            if (markedPickedUp) {
+                                                              setState(() {
+                                                                isPickedUp =
+                                                                    true;
+                                                              });
+                                                              switchToCustomerRoute();
+                                                              await promptForPickupProofPhoto(
+                                                                orderId:
+                                                                    orderDoc.id,
+                                                              );
+                                                            }
+
+                                                            if (mounted) {
+                                                              setState(
+                                                                () =>
+                                                                    isUpdatingStatus =
+                                                                        false,
+                                                              );
+                                                            }
+                                                            return;
+                                                          } else if (currentStatus ==
+                                                              "Picked Up") {
+                                                            final freshHasPickupProof =
+                                                                (freshData['pickupProofPhotoUrl'] ??
+                                                                        "")
+                                                                    .toString()
+                                                                    .isNotEmpty;
+
+                                                            if (!freshHasPickupProof) {
+                                                              await promptForPickupProofPhoto(
+                                                                orderId:
+                                                                    orderDoc.id,
+                                                              );
+
+                                                              if (mounted) {
+                                                                setState(
+                                                                  () =>
+                                                                      isUpdatingStatus =
+                                                                          false,
+                                                                );
+                                                              }
+                                                              return;
+                                                            }
+
+                                                            newStatus =
+                                                                "Delivered";
+                                                          } else {
+                                                            setState(
+                                                              () =>
+                                                                  isUpdatingStatus =
+                                                                      false,
+                                                            );
+                                                            return;
+                                                          }
+
+                                                          if (newStatus ==
+                                                              "Delivered") {
+                                                            final deliveryPin =
+                                                                await showDeliveryPinDialog();
+
+                                                            if (deliveryPin ==
+                                                                null) {
+                                                              if (mounted) {
+                                                                setState(
+                                                                  () =>
+                                                                      isUpdatingStatus =
+                                                                          false,
+                                                                );
+                                                              }
+                                                              return;
+                                                            }
+
+                                                            final callable =
+                                                                FirebaseFunctions
+                                                                    .instance
+                                                                    .httpsCallable(
+                                                                      'markOrderDelivered',
+                                                                    );
+                                                            HttpsCallableResult
+                                                            result;
+
+                                                            try {
+                                                              result = await callable
+                                                                  .call({
+                                                                    "orderId":
+                                                                        orderDoc
+                                                                            .id,
+                                                                    "deliveryPin":
+                                                                        deliveryPin,
+                                                                  });
+                                                            } on FirebaseFunctionsException catch (
+                                                              error
+                                                            ) {
+                                                              if (mounted) {
+                                                                ScaffoldMessenger.of(
+                                                                  context,
+                                                                ).showSnackBar(
+                                                                  SnackBar(
+                                                                    content: Text(
+                                                                      error.message ??
+                                                                          "Could not verify delivery PIN.",
+                                                                    ),
+                                                                  ),
+                                                                );
+                                                                setState(
+                                                                  () =>
+                                                                      isUpdatingStatus =
+                                                                          false,
+                                                                );
+                                                              }
+                                                              return;
+                                                            }
+
+                                                            final payoutStatus =
+                                                                result
+                                                                    .data['payoutStatus'];
+
+                                                            if (payoutStatus ==
+                                                                "pending_driver_onboarding") {
+                                                              ScaffoldMessenger.of(
+                                                                context,
+                                                              ).showSnackBar(
+                                                                SnackBar(
+                                                                  content: Text(
+                                                                    "Order delivered. Set up Stripe payouts to receive this pay.",
+                                                                  ),
+                                                                ),
+                                                              );
+                                                            } else if (payoutStatus ==
+                                                                "pending_withdrawal") {
+                                                              ScaffoldMessenger.of(
+                                                                context,
+                                                              ).showSnackBar(
+                                                                SnackBar(
+                                                                  content: Text(
+                                                                    "Order delivered. Pay is ready to withdraw from Earnings.",
+                                                                  ),
+                                                                ),
+                                                              );
+                                                            }
+                                                          }
+
+                                                          if (newStatus ==
+                                                              "Delivered") {
+                                                            setState(() {
+                                                              completedDriverOrderIds
+                                                                  .add(
+                                                                    orderDoc.id,
+                                                                  );
+                                                              clearDriverOrderMapState();
+                                                              isUpdatingStatus =
+                                                                  false;
+                                                            });
+
+                                                            locationTimer
+                                                                ?.cancel();
+                                                          }
+
+                                                          setState(
+                                                            () =>
+                                                                isUpdatingStatus =
+                                                                    false,
+                                                          );
+                                                        },
+                                                  child: Text(
+                                                    isWaitingForCustomer
+                                                        ? "Awaiting Reply"
+                                                        : status == "Accepted"
+                                                        ? "Mark Picked Up"
+                                                        : status == "Picked Up"
+                                                        ? hasPickupProof
+                                                              ? "Mark Delivered"
+                                                              : "Add Photo"
+                                                        : "",
+                                                  ),
+                                                ),
+                                              ),
+
+                                              SizedBox(width: 10),
+
+                                              // ❌ RED BUTTON
+                                              Expanded(
+                                                child: ElevatedButton(
+                                                  style: ElevatedButton.styleFrom(
+                                                    backgroundColor:
+                                                        Colors.red.shade600,
+                                                    foregroundColor:
+                                                        Colors.white,
+                                                    minimumSize:
+                                                        Size.fromHeight(44),
+                                                    shape: RoundedRectangleBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            8,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                  onPressed: () async {
+                                                    await cancelActiveOrder(
+                                                      orderId: orderDoc.id,
+                                                      status: status,
+                                                    );
+                                                  },
+                                                  child: Text(
+                                                    status == "Picked Up"
+                                                        ? "Cancel Delivery"
+                                                        : "Cancel Pickup",
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ],
                                       ),
                                     ),
                                   ),
-
-                                  SizedBox(width: 10),
-
-                                  // ❌ RED BUTTON
-                                  Expanded(
-                                    child: ElevatedButton(
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: Colors.red,
-                                      ),
-                                      onPressed: () async {
-                                        await FirebaseFirestore.instance
-                                            .collection('orders')
-                                            .doc(orderDoc.id)
-                                            .update({
-                                              "status": "Pending",
-                                              "driverId": null,
-                                            });
-
-                                        await FirebaseFirestore.instance
-                                            .collection('drivers')
-                                            .doc(
-                                              FirebaseAuth
-                                                  .instance
-                                                  .currentUser!
-                                                  .uid,
-                                            )
-                                            .set({
-                                              "isBusy": false,
-                                            }, SetOptions(merge: true));
-
-                                        // 🔥 RESET MAP + STATE
-                                        setState(() {
-                                          isOnActiveDelivery = false;
-                                          isPreviewingOrder = false;
-
-                                          // 🔥 CLEAR ROUTES
-                                          storeRoutePoints = [];
-                                          customerRoutePoints = [];
-
-                                          // 🔥 RESET FADE
-                                          customerRouteOpacity = 1.0;
-
-                                          // 🔥 CLEAR STORE TARGET
-                                          currentStoreLat = null;
-                                          currentStoreLng = null;
-
-                                          // 🔥 CLEAR DISTANCE TEXT
-                                          distanceText = null;
-                                          eta = null;
-                                        });
-
-                                        locationTimer?.cancel();
-                                      },
-                                      child: Text(
-                                        status == "Picked Up"
-                                            ? "Cancel Delivery"
-                                            : "Cancel Pickup",
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-
-              // 🔵 AVAILABLE ORDERS (ONLY if no active job, and pending order exists)
-              if (!hasActiveOrder && isOnline)
-                StreamBuilder<QuerySnapshot>(
-                  stream: isOnline
-                      ? FirebaseFirestore.instance
-                            .collection('orders')
-                            .where("status", isEqualTo: "Pending")
-                            .where(
-                              "eligibleDrivers",
-                              arrayContains:
-                                  FirebaseAuth.instance.currentUser!.uid,
+                                );
+                              },
                             )
-                            .snapshots()
-                      : null,
-                  builder: (context, snapshot) {
-                    if (!snapshot.hasData) {
-                      return SizedBox();
-                    }
+                          : isOnline
+                          ? StreamBuilder<QuerySnapshot>(
+                              key: ValueKey("available-orders"),
+                              stream: isOnline
+                                  ? FirebaseFirestore.instance
+                                        .collection('drivers')
+                                        .doc(
+                                          FirebaseAuth
+                                              .instance
+                                              .currentUser!
+                                              .uid,
+                                        )
+                                        .collection('availableOrders')
+                                        .snapshots()
+                                  : null,
+                              builder: (context, snapshot) {
+                                if (snapshot.hasError) {
+                                  debugPrint(
+                                    "Driver available orders stream error: ${snapshot.error}",
+                                  );
 
-                    final orders = snapshot.data!.docs;
+                                  return driverAvailabilityPrompt(
+                                    keyName: "driver-waiting-error",
+                                    iconColor: Colors.green,
+                                    message:
+                                        "Could not load delivery requests.",
+                                  );
+                                }
 
-                    if (orders.isEmpty) {
-                      return Padding(
-                        padding: EdgeInsets.symmetric(vertical: 12),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min, // 👈 IMPORTANT
-                          children: [
-                            Icon(
-                              Icons.local_shipping,
-                              size: 28,
-                              color: isOnline ? Colors.green : Colors.grey,
-                            ),
-                            SizedBox(height: 6),
-                            Text(
-                              isOnline
-                                  ? "Waiting for deliveries..."
-                                  : "Go online to receive deliveries",
-                              style: TextStyle(
-                                fontSize: 14,
-                                color: Colors.grey,
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    }
+                                if (!snapshot.hasData) {
+                                  return hasDriverLocation
+                                      ? driverAvailabilityPrompt(
+                                          keyName: "driver-waiting-loading",
+                                          iconColor: Colors.green,
+                                          message: "Waiting for deliveries...",
+                                        )
+                                      : driverLocationLoadingPrompt();
+                                }
 
-                    return AnimatedContainer(
-                      duration: Duration(milliseconds: 250),
-                      height: previewOrderId != null ? 235 : 220,
-                      child: ListView.builder(
-                        controller: _scrollController,
-                        scrollDirection: Axis.horizontal,
+                                final orders = snapshot.data!.docs.where((doc) {
+                                  final order =
+                                      doc.data() as Map<String, dynamic>;
+                                  return order["status"] == "Pending";
+                                }).toList();
 
-                        physics: previewOrderId != null
-                            ? NeverScrollableScrollPhysics()
-                            : BouncingScrollPhysics(),
+                                if (orders.isEmpty) {
+                                  return hasDriverLocation
+                                      ? driverAvailabilityPrompt(
+                                          keyName: "driver-waiting",
+                                          iconColor: Colors.green,
+                                          message: "Waiting for deliveries...",
+                                        )
+                                      : driverLocationLoadingPrompt();
+                                }
 
-                        itemCount: orders.length,
-                        itemBuilder: (context, index) {
-                          final order =
-                              orders[index].data() as Map<String, dynamic>;
-                          return _driverOrderCard(
-                            order,
-                            orders[index].id,
-                            index,
-                          );
-                        },
-                      ),
-                    );
-                  },
-                ),
+                                return AnimatedContainer(
+                                  duration: Duration(milliseconds: 420),
+                                  curve: Curves.easeInOutCubic,
+                                  height: previewOrderId != null ? 330 : 220,
+                                  child: ListView.builder(
+                                    controller: _scrollController,
+                                    scrollDirection: Axis.horizontal,
 
-              // 🗺️ MAP
-              Expanded(
-                child: GoogleMap(
-                  initialCameraPosition: CameraPosition(
-                    target: currentPosition,
-                    zoom: 15,
-                  ),
-                  onMapCreated: (controller) {
-                    mapController = controller;
-                  },
-                  myLocationEnabled: true,
-                  myLocationButtonEnabled: true,
+                                    physics: previewOrderId != null
+                                        ? NeverScrollableScrollPhysics()
+                                        : BouncingScrollPhysics(),
 
-                  // 🔥 ADD THIS PART
-                  markers: {
-                    // 🚗 DRIVER (always show)
-                    Marker(
-                      markerId: MarkerId("driver"),
-                      position: currentPosition,
-                      icon: BitmapDescriptor.defaultMarkerWithHue(
-                        BitmapDescriptor.hueAzure, // 🔵 BLUE
-                      ),
-                      infoWindow: InfoWindow(title: "You"),
+                                    itemCount: orders.length,
+                                    itemBuilder: (context, index) {
+                                      final order =
+                                          orders[index].data()
+                                              as Map<String, dynamic>;
+                                      return _driverOrderCard(
+                                        order,
+                                        orders[index].id,
+                                        index,
+                                      );
+                                    },
+                                  ),
+                                );
+                              },
+                            )
+                          : offlineDriverPrompt(),
                     ),
-
-                    // 🏪 STORE (preview OR active)
-                    if ((isPreviewingOrder || isOnActiveDelivery) &&
-                        previewStoreLat != null &&
-                        previewStoreLng != null)
-                      Marker(
-                        markerId: MarkerId("store"),
-                        position: LatLng(previewStoreLat!, previewStoreLng!),
-                        infoWindow: InfoWindow(title: "Store"),
-                        icon: BitmapDescriptor.defaultMarkerWithHue(
-                          BitmapDescriptor.hueGreen,
-                        ),
-                      )
-                    else if (currentStoreLat != null && currentStoreLng != null)
-                      Marker(
-                        markerId: MarkerId("store"),
-                        position: LatLng(currentStoreLat!, currentStoreLng!),
-                        infoWindow: InfoWindow(title: "Store"),
-                        icon: BitmapDescriptor.defaultMarkerWithHue(
-                          BitmapDescriptor.hueGreen,
-                        ),
-                      ),
-
-                    // 🏠 CUSTOMER (preview OR active)
-                    if (isPreviewingOrder &&
-                        previewCustomerLat != null &&
-                        previewCustomerLng != null)
-                      Marker(
-                        markerId: MarkerId("customer"),
-                        position: LatLng(
-                          previewCustomerLat!,
-                          previewCustomerLng!,
-                        ),
-                        infoWindow: InfoWindow(title: "Customer"),
-                        icon: BitmapDescriptor.defaultMarkerWithHue(
-                          BitmapDescriptor.hueRed,
-                        ),
-                      ),
-                  },
-                  polylines: {
-                    // 🔵 DRIVER → STORE
-                    if (storeRoutePoints.isNotEmpty)
-                      Polyline(
-                        polylineId: PolylineId("toStore"),
-                        points: storeRoutePoints,
-                        color: Colors.blue,
-                        width: 5,
-                      ),
-
-                    // 🟢 STORE → CUSTOMER (FADEABLE)
-                    if ((isPreviewingOrder || isOnActiveDelivery) &&
-                        customerRoutePoints.isNotEmpty)
-                      Polyline(
-                        polylineId: PolylineId("toCustomer"),
-                        points: customerRoutePoints,
-                        color: isPickedUp
-                            ? Colors.green
-                            : isOnActiveDelivery
-                            ? Colors.green.withOpacity(0.25)
-                            : Colors.green, // 👈 full brightness in preview
-                        width: 5,
-                      ),
-                  },
+                  ),
                 ),
               ),
+
+              // 🗺️ MAP
+              Expanded(child: _buildDriverMap()),
             ],
           );
         },
+      ),
+    );
+  }
+
+  Widget driverLocationLoadingPrompt() {
+    return Padding(
+      key: ValueKey("driver-location-loading"),
+      padding: EdgeInsets.symmetric(vertical: 14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(
+              strokeWidth: 3,
+              color: Colors.grey.shade600,
+            ),
+          ),
+          SizedBox(height: 8),
+          Text(
+            "Loading your location...",
+            style: TextStyle(fontSize: 14, color: Colors.grey.shade700),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget offlineDriverPrompt() {
+    return driverAvailabilityPrompt(
+      keyName: "driver-offline",
+      iconColor: Colors.grey,
+      message: "Go online to receive orders",
+    );
+  }
+
+  Widget driverAvailabilityPrompt({
+    required String keyName,
+    required Color iconColor,
+    required String message,
+  }) {
+    return Padding(
+      key: ValueKey(keyName),
+      padding: EdgeInsets.symmetric(vertical: 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.local_shipping, size: 28, color: iconColor),
+          SizedBox(height: 6),
+          Text(message, style: TextStyle(fontSize: 14, color: Colors.grey)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDriverMap() {
+    final hasDriverLocation =
+        currentPosition.latitude != 0 || currentPosition.longitude != 0;
+
+    return Stack(
+      children: [
+        GoogleMap(
+          initialCameraPosition: CameraPosition(
+            target: currentPosition,
+            zoom: 15,
+          ),
+          onMapCreated: (controller) {
+            mapController = controller;
+          },
+          myLocationEnabled: true,
+          myLocationButtonEnabled: true,
+          markers: {
+            if (hasDriverLocation)
+              Marker(
+                markerId: MarkerId("driver"),
+                position: currentPosition,
+                icon: BitmapDescriptor.defaultMarkerWithHue(
+                  BitmapDescriptor.hueAzure,
+                ),
+                infoWindow: InfoWindow(title: "You"),
+              ),
+            if ((isPreviewingOrder || isOnActiveDelivery) &&
+                previewStoreLat != null &&
+                previewStoreLng != null)
+              Marker(
+                markerId: MarkerId("store"),
+                position: LatLng(previewStoreLat!, previewStoreLng!),
+                infoWindow: InfoWindow(title: "Store"),
+                icon: BitmapDescriptor.defaultMarkerWithHue(
+                  BitmapDescriptor.hueGreen,
+                ),
+              )
+            else if (isOnActiveDelivery &&
+                currentStoreLat != null &&
+                currentStoreLng != null)
+              Marker(
+                markerId: MarkerId("store"),
+                position: LatLng(currentStoreLat!, currentStoreLng!),
+                infoWindow: InfoWindow(title: "Store"),
+                icon: BitmapDescriptor.defaultMarkerWithHue(
+                  BitmapDescriptor.hueGreen,
+                ),
+              ),
+            if (isPreviewingOrder &&
+                previewCustomerLat != null &&
+                previewCustomerLng != null)
+              Marker(
+                markerId: MarkerId("customer"),
+                position: LatLng(previewCustomerLat!, previewCustomerLng!),
+                infoWindow: InfoWindow(title: "Customer"),
+                icon: BitmapDescriptor.defaultMarkerWithHue(
+                  BitmapDescriptor.hueRed,
+                ),
+              ),
+          },
+          polylines: {
+            if ((isPreviewingOrder || isOnActiveDelivery) &&
+                storeRoutePoints.isNotEmpty)
+              Polyline(
+                polylineId: PolylineId("toStore"),
+                points: storeRoutePoints,
+                color: Colors.blue,
+                width: 5,
+              ),
+            if ((isPreviewingOrder || isOnActiveDelivery) &&
+                customerRoutePoints.isNotEmpty)
+              Polyline(
+                polylineId: PolylineId("toCustomer"),
+                points: customerRoutePoints,
+                color: isPickedUp
+                    ? Colors.green
+                    : isOnActiveDelivery
+                    ? Colors.green.withOpacity(0.25)
+                    : Colors.green,
+                width: 5,
+              ),
+          },
+        ),
+        Positioned(left: 14, bottom: 34, child: driverMapBalanceChip()),
+        if (!hasDriverLocation)
+          Positioned(
+            left: 12,
+            right: 12,
+            top: 12,
+            child: Container(
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.08),
+                    blurRadius: 8,
+                    offset: Offset(0, 3),
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      "Finding your location...",
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget driverMapBalanceChip() {
+    return GestureDetector(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => DriverEarningsScreen()),
+        );
+      },
+      child: Container(
+        padding: EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.86),
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: Colors.white, width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.22),
+              blurRadius: 10,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.account_balance_wallet, color: Colors.white, size: 18),
+            SizedBox(width: 7),
+            StreamBuilder<DocumentSnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('drivers')
+                  .doc(FirebaseAuth.instance.currentUser!.uid)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) {
+                  return Text(
+                    "\$0.00",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  );
+                }
+
+                final data = snapshot.data!.data() as Map<String, dynamic>?;
+                final earnings = (data?['earnings'] ?? 0).toDouble();
+
+                return Text(
+                  "\$${earnings.toStringAsFixed(2)}",
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -7069,6 +10439,10 @@ class _DriverScreenState extends State<DriverScreen> {
         totalQuantity += (item['quantity'] ?? 1) as int;
       }
     }
+    final previewItems = items
+        .whereType<Map<String, dynamic>>()
+        .take(3)
+        .toList();
 
     return GestureDetector(
       onTap: () {
@@ -7094,17 +10468,18 @@ class _DriverScreenState extends State<DriverScreen> {
         Future.delayed(Duration(milliseconds: 50), () {
           _scrollController.animateTo(
             index * 280.0,
-            duration: Duration(milliseconds: 300),
-            curve: Curves.easeInOut,
+            duration: Duration(milliseconds: 420),
+            curve: Curves.easeInOutCubic,
           );
         });
 
         previewRoute();
       },
       child: AnimatedContainer(
-        duration: Duration(milliseconds: 250),
+        duration: Duration(milliseconds: 420),
+        curve: Curves.easeInOutCubic,
         width: isSelected ? MediaQuery.of(context).size.width * 0.9 : 265,
-        height: isSelected ? 215 : 200,
+        height: isSelected ? 310 : 200,
         margin: EdgeInsets.fromLTRB(10, 10, 6, 10),
         padding: EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -7125,126 +10500,236 @@ class _DriverScreenState extends State<DriverScreen> {
         child: Stack(
           children: [
             Positioned.fill(
-              bottom: 50,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          storeName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ),
-                      SizedBox(width: 8),
-                      ConstrainedBox(
-                        constraints: BoxConstraints(maxWidth: 90),
-                        child: Container(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.blue.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
+              bottom: 56,
+              child: SingleChildScrollView(
+                physics: isSelected
+                    ? BouncingScrollPhysics()
+                    : NeverScrollableScrollPhysics(),
+                padding: EdgeInsets.only(bottom: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
                           child: Text(
-                            tradeType,
+                            storeName,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              color: Colors.blue.shade800,
-                              fontSize: 12,
                               fontWeight: FontWeight.bold,
+                              fontSize: 16,
                             ),
                           ),
                         ),
-                      ),
-                      if (isSelected) ...[
-                        SizedBox(width: 4),
-                        SizedBox(
-                          width: 34,
-                          height: 34,
-                          child: IconButton(
-                            padding: EdgeInsets.zero,
-                            tooltip: "Close preview",
-                            icon: Icon(Icons.close, size: 20),
-                            style: IconButton.styleFrom(
-                              backgroundColor: Colors.grey.shade100,
-                              foregroundColor: Colors.grey.shade700,
+                        SizedBox(width: 8),
+                        ConstrainedBox(
+                          constraints: BoxConstraints(maxWidth: 90),
+                          child: Container(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
                             ),
-                            onPressed: () {
-                              setState(() {
-                                previewOrderId = null;
-                                previewStoreLat = null;
-                                previewStoreLng = null;
-                                previewCustomerLat = null;
-                                previewCustomerLng = null;
+                            decoration: BoxDecoration(
+                              color: Colors.blue.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text(
+                              tradeType,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: Colors.blue.shade800,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: 4),
+                        AnimatedOpacity(
+                          duration: Duration(milliseconds: 300),
+                          curve: Curves.easeOutCubic,
+                          opacity: isSelected ? 1 : 0,
+                          child: IgnorePointer(
+                            ignoring: !isSelected,
+                            child: SizedBox(
+                              width: 34,
+                              height: 34,
+                              child: IconButton(
+                                padding: EdgeInsets.zero,
+                                tooltip: "Close preview",
+                                icon: Icon(Icons.close, size: 20),
+                                style: IconButton.styleFrom(
+                                  backgroundColor: Colors.grey.shade100,
+                                  foregroundColor: Colors.grey.shade700,
+                                ),
+                                onPressed: () {
+                                  setState(() {
+                                    previewOrderId = null;
+                                    previewStoreLat = null;
+                                    previewStoreLng = null;
+                                    previewCustomerLat = null;
+                                    previewCustomerLng = null;
 
-                                isPreviewingOrder = false;
-                                isOnActiveDelivery = false;
+                                    isPreviewingOrder = false;
+                                    isOnActiveDelivery = false;
 
-                                storeRoutePoints = [];
-                                customerRoutePoints = [];
-                                customerRouteOpacity = 1.0;
-                                previewDistance = null;
-                                previewDuration = null;
-                              });
-                            },
+                                    storeRoutePoints = [];
+                                    customerRoutePoints = [];
+                                    customerRouteOpacity = 1.0;
+                                    previewDistance = null;
+                                    previewDuration = null;
+                                  });
+                                },
+                              ),
+                            ),
                           ),
                         ),
                       ],
-                    ],
-                  ),
-                  SizedBox(height: 4),
-                  Text(
-                    customerName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: Colors.grey.shade700),
-                  ),
-                  SizedBox(height: 10),
-                  Row(
-                    children: [
-                      _smallDriverStat(
-                        Icons.inventory_2,
-                        "$totalQuantity items",
-                      ),
-                      SizedBox(width: 8),
-                      _smallDriverStat(
-                        Icons.attach_money,
-                        total.toStringAsFixed(2),
-                      ),
-                    ],
-                  ),
-                  if (isSelected &&
-                      previewDistance != null &&
-                      previewDuration != null)
-                    Padding(
-                      padding: EdgeInsets.only(top: 12),
-                      child: Row(
-                        children: [
-                          Icon(Icons.route, size: 16, color: Colors.green[700]),
-                          SizedBox(width: 5),
-                          Text(
-                            "$previewDistance • $previewDuration",
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 14,
+                    ),
+                    SizedBox(height: 4),
+                    Text(
+                      customerName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: Colors.grey.shade700),
+                    ),
+                    SizedBox(height: 10),
+                    Row(
+                      children: [
+                        _smallDriverStat(
+                          Icons.inventory_2,
+                          "$totalQuantity items",
+                        ),
+                        SizedBox(width: 8),
+                        _smallDriverStat(
+                          Icons.attach_money,
+                          total.toStringAsFixed(2),
+                        ),
+                      ],
+                    ),
+                    if (isSelected &&
+                        previewDistance != null &&
+                        previewDuration != null)
+                      Padding(
+                        padding: EdgeInsets.only(top: 12),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.route,
+                              size: 16,
                               color: Colors.green[700],
                             ),
-                          ),
-                        ],
+                            SizedBox(width: 5),
+                            Text(
+                              "$previewDistance • $previewDuration",
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                                color: Colors.green[700],
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                ],
+                    if (isSelected) ...[
+                      SizedBox(height: 10),
+                      Container(
+                        width: double.infinity,
+                        padding: EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey.shade200),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              "Parts on order",
+                              style: TextStyle(
+                                color: Colors.grey.shade700,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SizedBox(height: 6),
+                            if (previewItems.isEmpty)
+                              Text(
+                                "No parts listed",
+                                style: TextStyle(
+                                  color: Colors.grey.shade600,
+                                  fontSize: 12,
+                                ),
+                              )
+                            else
+                              ...previewItems.map((item) {
+                                final name = (item['name'] ?? 'Part')
+                                    .toString();
+                                final quantity = item['quantity'] ?? 1;
+
+                                return Padding(
+                                  padding: EdgeInsets.only(bottom: 4),
+                                  child: Row(
+                                    children: [
+                                      Container(
+                                        width: 22,
+                                        height: 22,
+                                        alignment: Alignment.center,
+                                        decoration: BoxDecoration(
+                                          color: Colors.blue.withOpacity(0.1),
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          "x$quantity",
+                                          style: TextStyle(
+                                            color: Colors.blue.shade800,
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                      SizedBox(width: 7),
+                                      _previewItemThumbnail(item),
+                                      SizedBox(width: 7),
+                                      Expanded(
+                                        child: Text(
+                                          name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }),
+                            if (items.length > previewItems.length)
+                              Padding(
+                                padding: EdgeInsets.only(top: 1),
+                                child: Text(
+                                  "+${items.length - previewItems.length} more parts",
+                                  style: TextStyle(
+                                    color: Colors.grey.shade600,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
               ),
             ),
             Positioned(
@@ -7263,35 +10748,31 @@ class _DriverScreenState extends State<DriverScreen> {
                   ),
                   onPressed: isSelected
                       ? () async {
-                          final user = FirebaseAuth.instance.currentUser;
-
-                          final orderRef = FirebaseFirestore.instance
-                              .collection('orders')
-                              .doc(orderId);
-
-                          final freshOrder = await orderRef.get();
-
-                          final freshData = freshOrder.data();
-
-                          if (freshData == null ||
-                              freshData["status"] != "Pending") {
+                          try {
+                            final callable = FirebaseFunctions.instance
+                                .httpsCallable('acceptOrder');
+                            await callable.call({"orderId": orderId});
+                          } on FirebaseFunctionsException catch (error) {
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
-                                content: Text("Order was already accepted"),
+                                content: Text(
+                                  error.message ?? "Order was already accepted",
+                                ),
+                              ),
+                            );
+                            return;
+                          } catch (_) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  "Could not accept this order. Please try again.",
+                                ),
                               ),
                             );
                             return;
                           }
 
-                          await orderRef.update({
-                            "status": "Accepted",
-                            "driverId": user!.uid,
-                          });
-
-                          await FirebaseFirestore.instance
-                              .collection('drivers')
-                              .doc(user.uid)
-                              .set({"isBusy": true}, SetOptions(merge: true));
+                          if (!mounted) return;
 
                           setState(() {
                             currentStoreLat = previewStoreLat;
@@ -7314,6 +10795,116 @@ class _DriverScreenState extends State<DriverScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _previewItemThumbnail(Map<String, dynamic> item) {
+    final imagePath = (item['image'] ?? '').toString();
+    final name = (item['name'] ?? 'Part').toString();
+
+    return InkWell(
+      onTap: imagePath.isEmpty
+          ? null
+          : () => _showPreviewItemImage(imagePath: imagePath, itemName: name),
+      borderRadius: BorderRadius.circular(7),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(7),
+        child: Container(
+          width: 30,
+          height: 30,
+          color: Colors.white,
+          child: imagePath.isEmpty
+              ? Icon(Icons.inventory_2, size: 16, color: Colors.grey.shade500)
+              : Image.asset(
+                  imagePath,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) {
+                    return Icon(
+                      Icons.inventory_2,
+                      size: 16,
+                      color: Colors.grey.shade500,
+                    );
+                  },
+                ),
+        ),
+      ),
+    );
+  }
+
+  void _showPreviewItemImage({
+    required String imagePath,
+    required String itemName,
+  }) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          insetPadding: EdgeInsets.symmetric(horizontal: 22, vertical: 32),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Padding(
+            padding: EdgeInsets.all(14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        itemName,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: "Close",
+                      icon: Icon(Icons.close),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+                SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Container(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.of(context).size.height * 0.55,
+                    ),
+                    width: double.infinity,
+                    color: Colors.grey.shade100,
+                    child: InteractiveViewer(
+                      minScale: 1,
+                      maxScale: 3,
+                      child: Image.asset(
+                        imagePath,
+                        fit: BoxFit.contain,
+                        errorBuilder: (context, error, stackTrace) {
+                          return SizedBox(
+                            height: 220,
+                            child: Center(
+                              child: Icon(
+                                Icons.inventory_2,
+                                size: 42,
+                                color: Colors.grey.shade500,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -7344,12 +10935,162 @@ class _DriverScreenState extends State<DriverScreen> {
     );
   }
 
+  Future<ImageSource?> choosePickupProofPhotoSource() {
+    return showModalBottomSheet<ImageSource>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 42,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                ),
+                SizedBox(height: 14),
+                Text(
+                  "Add pickup proof",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  "Take a photo of the item or receipt before continuing the delivery.",
+                  style: TextStyle(color: Colors.grey.shade700),
+                ),
+                SizedBox(height: 12),
+                ListTile(
+                  leading: Icon(Icons.photo_camera, color: Colors.green),
+                  title: Text("Take photo"),
+                  onTap: () => Navigator.pop(context, ImageSource.camera),
+                ),
+                ListTile(
+                  leading: Icon(Icons.photo_library, color: Colors.blueGrey),
+                  title: Text("Choose from gallery"),
+                  onTap: () => Navigator.pop(context, ImageSource.gallery),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<String?> showDeliveryPinDialog() async {
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _DeliveryPinDialog(),
+    );
+  }
+
+  Future<bool> promptForPickupProofPhoto({required String orderId}) async {
+    final uploaded = await uploadPickupProofPhoto(orderId: orderId);
+
+    if (mounted && uploaded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Photo saved. You can continue the delivery.")),
+      );
+    }
+
+    return uploaded;
+  }
+
+  Future<bool> uploadPickupProofPhoto({required String orderId}) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return false;
+
+    try {
+      final source = await choosePickupProofPhotoSource();
+      if (source == null) return false;
+
+      final picker = ImagePicker();
+      final image = await picker.pickImage(
+        source: source,
+        imageQuality: 85,
+        maxWidth: 1600,
+      );
+
+      if (image == null) return false;
+
+      final bytes = await image.readAsBytes();
+      final path =
+          "pickup_proofs/$orderId/${DateTime.now().millisecondsSinceEpoch}.jpg";
+      final ref = FirebaseStorage.instance.ref(path);
+
+      await ref.putData(
+        bytes,
+        SettableMetadata(
+          contentType: "image/jpeg",
+          customMetadata: {
+            "orderId": orderId,
+            "driverId": user.uid,
+            "proofType": "item_or_receipt",
+          },
+        ),
+      );
+
+      final photoUrl = await ref.getDownloadURL();
+
+      await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
+        "pickupProofPhotoUrl": photoUrl,
+        "pickupProofPhotoPath": path,
+        "pickupProofUploadedAt": FieldValue.serverTimestamp(),
+        "pickupProofUploadedBy": user.uid,
+      }, SetOptions(merge: true));
+
+      return true;
+    } on FirebaseException catch (error) {
+      debugPrint("❌ PICKUP PROOF UPLOAD ERROR: ${error.code} ${error.message}");
+
+      if (mounted) {
+        final message = error.code == "unauthorized"
+            ? "Photo upload was denied by Firebase Storage rules."
+            : error.message ??
+                  "Could not save the photo. Please try again before delivery.";
+
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(message)));
+      }
+      return false;
+    } catch (error) {
+      debugPrint("❌ PICKUP PROOF UPLOAD ERROR: $error");
+
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(
+                "Could not save the photo. Please try again before delivery.",
+              ),
+            ),
+          );
+      }
+      return false;
+    }
+  }
+
   Future<bool> markOrderPickedUp({
     required String orderId,
     required double storeLat,
     required double storeLng,
   }) async {
-    const pickupRadiusMeters = 300.0;
+    const pickupRadiusMeters = 16093.0;
     final user = FirebaseAuth.instance.currentUser;
 
     if (user == null) return false;
@@ -7380,15 +11121,20 @@ class _DriverScreenState extends State<DriverScreen> {
       );
 
       if (distanceMeters > pickupRadiusMeters) {
-        final distanceText = distanceMeters >= 1000
-            ? "${(distanceMeters / 1000).toStringAsFixed(1)} km"
-            : "${distanceMeters.round()} m";
+        final distanceFeet = distanceMeters * 3.28084;
+        final distanceText = distanceFeet < 5280
+            ? "${distanceFeet.round()} ft"
+            : "${(distanceFeet / 5280).toStringAsFixed(1)} mi";
+        final pickupRadiusFeet = pickupRadiusMeters * 3.28084;
+        final pickupRadiusText = pickupRadiusFeet < 5280
+            ? "${pickupRadiusFeet.round()} ft"
+            : "${(pickupRadiusFeet / 5280).toStringAsFixed(1)} mi";
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
-                "You are $distanceText from the store. Move within 300 m to mark this order picked up.",
+                "You are $distanceText from the store. Move within $pickupRadiusText to mark this order picked up.",
               ),
             ),
           );
@@ -7431,6 +11177,175 @@ class _DriverScreenState extends State<DriverScreen> {
         ).showSnackBar(SnackBar(content: Text(message)));
       }
       return false;
+    }
+  }
+
+  Future<Map<String, String>?> showDriverCancelReasonSheet() async {
+    final reasons = [
+      {
+        "code": "vehicle_broke_down",
+        "label": "Vehicle broke down",
+        "icon": Icons.car_repair,
+      },
+      {
+        "code": "payment_problem",
+        "label": "Payment problem",
+        "icon": Icons.credit_card_off,
+      },
+      {
+        "code": "not_in_stock",
+        "label": "Not in stock",
+        "icon": Icons.inventory_2_outlined,
+      },
+    ];
+
+    return showModalBottomSheet<Map<String, String>>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 42,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade300,
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                ),
+                SizedBox(height: 16),
+                Text(
+                  "Why are you cancelling?",
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  "If an item is not in stock, the customer will be asked whether to try another nearby store.",
+                  style: TextStyle(color: Colors.grey.shade700),
+                ),
+                SizedBox(height: 12),
+                ...reasons.map((reason) {
+                  return Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        side: BorderSide(color: Colors.grey.shade200),
+                      ),
+                      leading: Icon(
+                        reason["icon"] as IconData,
+                        color: Colors.red.shade600,
+                      ),
+                      title: Text(
+                        reason["label"] as String,
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      trailing: Icon(Icons.chevron_right),
+                      onTap: () {
+                        Navigator.pop(context, {
+                          "code": reason["code"] as String,
+                          "label": reason["label"] as String,
+                        });
+                      },
+                    ),
+                  );
+                }),
+                SizedBox(height: 4),
+                SizedBox(
+                  width: double.infinity,
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: Text("Keep Order"),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> cancelActiveOrder({
+    required String orderId,
+    required String status,
+  }) async {
+    if (status == "Picked Up") {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              "This order has already been picked up. Contact support if there is a problem.",
+            ),
+          ),
+        );
+      return;
+    }
+
+    final cancelReason = await showDriverCancelReasonSheet();
+    if (cancelReason == null) return;
+
+    bool isNotInStock;
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'driverCancelOrder',
+      );
+      final result = await callable.call({
+        "orderId": orderId,
+        "reasonCode": cancelReason["code"],
+      });
+      final data = Map<String, dynamic>.from(result.data as Map);
+      isNotInStock = data["isWaitingForCustomer"] == true;
+    } on FirebaseFunctionsException catch (error) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              error.message ?? "Could not cancel this order right now.",
+            ),
+          ),
+        );
+      return;
+    } catch (_) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text("Could not cancel this order right now.")),
+        );
+      return;
+    }
+
+    setState(() {
+      isOnActiveDelivery = isNotInStock;
+      isPreviewingOrder = false;
+      if (!isNotInStock) {
+        storeRoutePoints = [];
+        customerRoutePoints = [];
+      }
+      customerRouteOpacity = 1.0;
+      if (!isNotInStock) {
+        currentStoreLat = null;
+        currentStoreLng = null;
+      }
+      distanceText = null;
+      eta = null;
+    });
+
+    if (!isNotInStock) {
+      locationTimer?.cancel();
     }
   }
 
@@ -7480,7 +11395,256 @@ class _DriverScreenState extends State<DriverScreen> {
   }
 }
 
-class DriverEarningsScreen extends StatelessWidget {
+class DriverEarningsScreen extends StatefulWidget {
+  @override
+  State<DriverEarningsScreen> createState() => _DriverEarningsScreenState();
+}
+
+class _DriverEarningsScreenState extends State<DriverEarningsScreen>
+    with WidgetsBindingObserver {
+  bool isCheckingPayoutStatus = false;
+  bool isWithdrawingBalance = false;
+  bool isPayoutReady = false;
+  String payoutStatusText = "Checking payout setup...";
+  int withdrawableCents = 0;
+  int payoutReviewCents = 0;
+  int legacyBalanceCents = 0;
+  int payoutReviewCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    refreshPayoutStatus();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      refreshPayoutStatus();
+    }
+  }
+
+  Future<void> refreshPayoutStatus() async {
+    if (isCheckingPayoutStatus) return;
+
+    setState(() {
+      isCheckingPayoutStatus = true;
+      payoutStatusText = "Checking payout setup...";
+    });
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'getDriverPayoutStatus',
+      );
+      final result = await callable.call();
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final ready = data["ready"] == true;
+      final bankName = data["bankName"]?.toString();
+      final bankLast4 = data["bankLast4"]?.toString();
+      final availableCents = data["availableCents"] is num
+          ? (data["availableCents"] as num).toInt()
+          : 0;
+      final reviewCents = data["reviewCents"] is num
+          ? (data["reviewCents"] as num).toInt()
+          : 0;
+      final legacyCents = data["legacyBalanceCents"] is num
+          ? (data["legacyBalanceCents"] as num).toInt()
+          : 0;
+      final reviewCount = data["reviewCount"] is num
+          ? (data["reviewCount"] as num).toInt()
+          : 0;
+
+      if (!mounted) return;
+
+      setState(() {
+        isPayoutReady = ready;
+        withdrawableCents = availableCents;
+        payoutReviewCents = reviewCents;
+        legacyBalanceCents = legacyCents;
+        payoutReviewCount = reviewCount;
+        isCheckingPayoutStatus = false;
+        payoutStatusText = ready && bankLast4 != null && bankLast4.isNotEmpty
+            ? "${bankName == null || bankName.isEmpty ? "Bank account" : bankName} ending in $bankLast4"
+            : ready
+            ? "Payouts ready"
+            : "Payout setup needs to be finished";
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        isPayoutReady = false;
+        withdrawableCents = 0;
+        isCheckingPayoutStatus = false;
+        payoutStatusText = "Could not check payout setup";
+      });
+    }
+  }
+
+  Future<void> openPayoutSetup() async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'createDriverDashboardLink',
+      );
+
+      final result = await callable.call();
+
+      final url = result.data['url'];
+
+      if (url == null) {
+        throw Exception("No Stripe link returned");
+      }
+
+      final uri = Uri.parse(url);
+
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      await refreshPayoutStatus();
+    } catch (e) {
+      print("Payout setup error: $e");
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Could not open Stripe payout setup")),
+      );
+    }
+  }
+
+  Future<void> withdrawAvailableBalance(int availableCents) async {
+    if (isWithdrawingBalance || availableCents <= 0) return;
+
+    setState(() {
+      isWithdrawingBalance = true;
+    });
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'withdrawDriverBalance',
+      );
+      final result = await callable.call();
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final amountCents = data["amountCents"] is num
+          ? (data["amountCents"] as num).toInt()
+          : 0;
+      final failedCount = data["failedCount"] is num
+          ? (data["failedCount"] as num).toInt()
+          : 0;
+      final amountText = (amountCents / 100).toStringAsFixed(2);
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              failedCount > 0
+                  ? "Withdrew \$$amountText. Some payouts need review."
+                  : "Withdrew \$$amountText to Stripe Express.",
+            ),
+          ),
+        );
+      await refreshPayoutStatus();
+    } on FirebaseFunctionsException catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              error.message ?? "Could not withdraw balance right now.",
+            ),
+          ),
+        );
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text("Could not withdraw balance right now.")),
+        );
+    } finally {
+      if (mounted) {
+        setState(() {
+          isWithdrawingBalance = false;
+        });
+      }
+    }
+  }
+
+  Widget earningsActionButton({
+    required BuildContext context,
+    required String label,
+    required IconData icon,
+    required Color color,
+    VoidCallback? onTap,
+    bool filled = false,
+  }) {
+    final isDisabled = onTap == null;
+    final effectiveColor = isDisabled ? Colors.grey : color;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Ink(
+          padding: EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            color: filled
+                ? effectiveColor
+                : isDisabled
+                ? Colors.grey.shade100
+                : Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: effectiveColor, width: 2),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 10,
+                offset: Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                size: 30,
+                color: filled ? Colors.white : effectiveColor,
+              ),
+              SizedBox(width: 16),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                    color: filled ? Colors.white : effectiveColor,
+                  ),
+                ),
+              ),
+              Icon(
+                Icons.arrow_forward_ios,
+                size: 18,
+                color: filled ? Colors.white : effectiveColor,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
@@ -7499,116 +11663,316 @@ class DriverEarningsScreen extends StatelessWidget {
 
           final data = snapshot.data!.data() as Map<String, dynamic>?;
 
-          final earnings = (data?['earnings'] ?? 0).toDouble();
+          final availableBalance = withdrawableCents / 100;
+          final reviewBalance = (payoutReviewCents + legacyBalanceCents) / 100;
+          final careerEarnings = (data?['careerEarnings'] ?? availableBalance)
+              .toDouble();
+          final actionsEnabled =
+              !isCheckingPayoutStatus && !isWithdrawingBalance;
 
-          return Padding(
-            padding: EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                SizedBox(height: 20),
+          return appScreenFade(
+            child: SingleChildScrollView(
+              padding: EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(height: 20),
 
-                Text(
-                  "Available Balance",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 16, color: Colors.grey[700]),
-                ),
-
-                SizedBox(height: 10),
-
-                Text(
-                  "\$${earnings.toStringAsFixed(2)}",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 42, fontWeight: FontWeight.bold),
-                ),
-
-                SizedBox(height: 30),
-
-                Container(
-                  padding: EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[100],
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      Text(
-                        "Payout Method",
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "Available Balance",
+                              style: TextStyle(
+                                fontSize: 16,
+                                color: Colors.grey[700],
+                              ),
+                            ),
+
+                            SizedBox(height: 6),
+
+                            Text(
+                              "\$${availableBalance.toStringAsFixed(2)}",
+                              style: TextStyle(
+                                fontSize: 40,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+
+                            SizedBox(height: 4),
+
+                            Text(
+                              "Career earnings: \$${careerEarnings.toStringAsFixed(2)}",
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: Colors.grey.shade600,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+
+                            if (reviewBalance > 0) ...[
+                              SizedBox(height: 4),
+                              Text(
+                                "Needs review: \$${reviewBalance.toStringAsFixed(2)}"
+                                "${payoutReviewCount > 0 ? " ($payoutReviewCount order${payoutReviewCount == 1 ? "" : "s"})" : ""}",
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: Colors.orange.shade900,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
 
-                      SizedBox(height: 8),
+                      SizedBox(width: 14),
 
-                      Text(
-                        "Stripe payout setup will go here.",
-                        style: TextStyle(color: Colors.grey[700]),
+                      SizedBox(
+                        width: 132,
+                        height: 82,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(16),
+                            onTap:
+                                actionsEnabled &&
+                                    isPayoutReady &&
+                                    withdrawableCents > 0
+                                ? () => withdrawAvailableBalance(
+                                    withdrawableCents,
+                                  )
+                                : null,
+                            child: Ink(
+                              decoration: BoxDecoration(
+                                color:
+                                    actionsEnabled &&
+                                        isPayoutReady &&
+                                        withdrawableCents > 0
+                                    ? Colors.green
+                                    : Colors.grey,
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(
+                                  color:
+                                      actionsEnabled &&
+                                          isPayoutReady &&
+                                          withdrawableCents > 0
+                                      ? Colors.green.shade700
+                                      : Colors.grey.shade500,
+                                  width: 2,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withOpacity(0.08),
+                                    blurRadius: 10,
+                                    offset: Offset(0, 4),
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.payments,
+                                    color: Colors.white,
+                                    size: 26,
+                                  ),
+                                  SizedBox(height: 6),
+                                  Text(
+                                    isWithdrawingBalance
+                                        ? "Withdrawing"
+                                        : "Withdraw",
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ],
                   ),
-                ),
 
-                SizedBox(height: 20),
+                  SizedBox(height: 24),
 
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    minimumSize: Size(double.infinity, 52),
-                    backgroundColor: Colors.green,
-                  ),
-                  onPressed: earnings > 0
-                      ? () async {
-                          try {
-                            final callable = FirebaseFunctions.instance
-                                .httpsCallable('createDriverDashboardLink');
+                  Container(
+                    padding: EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [Colors.grey.shade300, Colors.grey.shade100],
+                        stops: [0.0, 0.55],
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.grey.shade300),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "Payout Method",
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
 
-                            final result = await callable.call();
+                        SizedBox(height: 8),
 
-                            final url = result.data['url'];
+                        Text(
+                          "Set up or manage your Stripe Express payout account.",
+                          style: TextStyle(color: Colors.grey[700]),
+                        ),
 
-                            if (url == null) {
-                              throw Exception("No Stripe link returned");
-                            }
+                        SizedBox(height: 12),
 
-                            final uri = Uri.parse(url);
-
-                            await launchUrl(
-                              uri,
-                              mode: LaunchMode.externalApplication,
-                            );
-                          } catch (e) {
-                            print("Withdraw error: $e");
-
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(
-                                  "Could not open Stripe withdrawal page",
+                        Container(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 9,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isPayoutReady
+                                ? Colors.green.withOpacity(0.1)
+                                : Colors.orange.withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(
+                              color: isPayoutReady
+                                  ? Colors.green
+                                  : Colors.orange.shade700,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isCheckingPayoutStatus)
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              else
+                                Icon(
+                                  isPayoutReady
+                                      ? Icons.check_circle
+                                      : Icons.warning_amber_rounded,
+                                  size: 18,
+                                  color: isPayoutReady
+                                      ? Colors.green
+                                      : Colors.orange.shade800,
                                 ),
+                              SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  payoutStatusText,
+                                  style: TextStyle(
+                                    color: isPayoutReady
+                                        ? Colors.green.shade800
+                                        : Colors.orange.shade900,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: "Refresh payout status",
+                                onPressed: actionsEnabled
+                                    ? refreshPayoutStatus
+                                    : null,
+                                icon: Icon(Icons.refresh, size: 18),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  SizedBox(height: 20),
+
+                  earningsActionButton(
+                    context: context,
+                    label: "Set Up Stripe Express",
+                    icon: Icons.account_balance,
+                    color: Colors.green,
+                    filled: true,
+                    onTap: actionsEnabled && !isPayoutReady
+                        ? openPayoutSetup
+                        : null,
+                  ),
+
+                  SizedBox(height: 10),
+
+                  Text(
+                    "Already have an account? Just set one up? Connect it to the app here.",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.grey.shade600,
+                      fontSize: 12,
+                      decoration: TextDecoration.underline,
+                      decorationColor: Colors.grey.shade600,
+                    ),
+                  ),
+
+                  SizedBox(height: 10),
+
+                  earningsActionButton(
+                    context: context,
+                    label: "Connect/Manage Stripe Express Account",
+                    icon: Icons.link,
+                    color: Colors.green,
+                    onTap: actionsEnabled
+                        ? () async {
+                            await refreshPayoutStatus();
+
+                            if (!context.mounted) return;
+
+                            ScaffoldMessenger.of(context)
+                              ..hideCurrentSnackBar()
+                              ..showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isPayoutReady
+                                        ? "Stripe Express account connected."
+                                        : "Stripe still needs a little more setup.",
+                                  ),
+                                ),
+                              );
+                          }
+                        : null,
+                  ),
+
+                  SizedBox(height: 12),
+
+                  earningsActionButton(
+                    context: context,
+                    label: "View Earnings History",
+                    icon: Icons.receipt_long,
+                    color: Theme.of(context).colorScheme.primary,
+                    onTap: actionsEnabled
+                        ? () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => DriverEarningsHistoryScreen(),
                               ),
                             );
                           }
-                        }
-                      : null,
-                  child: Text("Withdraw"),
-                ),
-
-                SizedBox(height: 12),
-
-                TextButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => DriverEarningsHistoryScreen(),
-                      ),
-                    );
-                  },
-                  child: Text("View Earnings History"),
-                ),
-              ],
+                        : null,
+                  ),
+                ],
+              ),
             ),
           );
         },
@@ -7622,21 +11986,58 @@ class DriverEarningsHistoryScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
 
+    if (user == null) {
+      return Scaffold(
+        appBar: AppBar(title: Text("Earnings History")),
+        body: Center(child: Text("Sign in to view earnings history.")),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(title: Text("Earnings History")),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('orders')
-            .where('driverId', isEqualTo: user!.uid)
-            .where('status', isEqualTo: "Delivered")
-            .orderBy('createdAt', descending: true) // 🔥 newest first
+            .where('driverId', isEqualTo: user.uid)
             .snapshots(),
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            debugPrint("Earnings history error: ${snapshot.error}");
+
+            return Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Text(
+                  "Could not load earnings history right now.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey.shade700),
+                ),
+              ),
+            );
+          }
+
           if (!snapshot.hasData) {
             return Center(child: CircularProgressIndicator());
           }
 
-          final orders = snapshot.data!.docs;
+          final orders =
+              snapshot.data!.docs.where((doc) {
+                final data = doc.data() as Map<String, dynamic>;
+                return data['status'] == "Delivered";
+              }).toList()..sort((a, b) {
+                final aData = a.data() as Map<String, dynamic>;
+                final bData = b.data() as Map<String, dynamic>;
+                final aCreatedAt = aData['createdAt'];
+                final bCreatedAt = bData['createdAt'];
+                final aMillis = aCreatedAt is Timestamp
+                    ? aCreatedAt.millisecondsSinceEpoch
+                    : 0;
+                final bMillis = bCreatedAt is Timestamp
+                    ? bCreatedAt.millisecondsSinceEpoch
+                    : 0;
+
+                return bMillis.compareTo(aMillis);
+              });
 
           if (orders.isEmpty) {
             return Center(child: Text("No earnings yet"));
@@ -7819,6 +12220,8 @@ class _CustomerNameScreenState extends State<CustomerNameScreen> {
     await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
       "name": nameController.text.trim(),
       "role": "customer",
+      "deliveryPin": generateCustomerDeliveryPin(),
+      "deliveryPinUpdatedAt": FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
 
     // 🔥 GO TO HOME
@@ -7956,24 +12359,20 @@ class _AddressSearchScreenState extends State<AddressSearchScreen> {
       return;
     }
 
-    final apiKey = "AIzaSyAekQ_K5c2zzW_wmDxZySFehntN1v2YVhU";
-
-    final url =
-        "https://maps.googleapis.com/maps/api/place/autocomplete/json?input=$input&key=$apiKey";
-
     try {
-      final response = await http.get(Uri.parse(url));
-      final data = jsonDecode(response.body);
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'autocompleteAddress',
+      );
+      final result = await callable.call({"input": input});
+      final data = Map<String, dynamic>.from(result.data as Map);
 
-      if (data['status'] == "OK") {
-        setState(() {
-          predictions = data['predictions'];
-        });
-      } else {
-        print("❌ AUTOCOMPLETE ERROR: ${data['status']}");
-      }
-    } catch (e) {
-      print("❌ ERROR: $e");
+      setState(() {
+        predictions = List<dynamic>.from(data['predictions'] ?? []);
+      });
+    } on FirebaseFunctionsException catch (error) {
+      print("❌ AUTOCOMPLETE ERROR: ${error.code} ${error.message ?? ''}");
+    } catch (error) {
+      print("❌ ERROR: $error");
     }
   }
 
@@ -7981,27 +12380,17 @@ class _AddressSearchScreenState extends State<AddressSearchScreen> {
     final placeId = place['place_id'];
     final selectedAddress = place['description']; // 👈 LOCK USER TEXT
 
-    final apiKey = "AIzaSyAekQ_K5c2zzW_wmDxZySFehntN1v2YVhU";
-
     print("👉 USER SELECTED: $selectedAddress");
 
-    final detailsUrl =
-        "https://maps.googleapis.com/maps/api/place/details/json?place_id=$placeId&key=$apiKey";
-
     try {
-      final response = await http.get(Uri.parse(detailsUrl));
-      final data = jsonDecode(response.body);
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'getPlaceDetails',
+      );
+      final details = await callable.call({"placeId": placeId});
+      final data = Map<String, dynamic>.from(details.data as Map);
 
-      if (data['status'] != "OK") {
-        print("❌ DETAILS ERROR: ${data['status']}");
-        return;
-      }
-
-      final result = data['result'];
-      final location = result['geometry']['location'];
-
-      final lat = (location['lat'] as num).toDouble();
-      final lng = (location['lng'] as num).toDouble();
+      final lat = (data['lat'] as num).toDouble();
+      final lng = (data['lng'] as num).toDouble();
 
       print("📍 COORDS: $lat, $lng");
 
@@ -8012,12 +12401,14 @@ class _AddressSearchScreenState extends State<AddressSearchScreen> {
           builder: (_) => ConfirmLocationScreen(
             lat: lat,
             lng: lng,
-            address: selectedAddress, // 👈 KEEP USER VERSION
+            address: selectedAddress ?? data['address'] ?? "",
           ),
         ),
       );
-    } catch (e) {
-      print("❌ ERROR: $e");
+    } on FirebaseFunctionsException catch (error) {
+      print("❌ DETAILS ERROR: ${error.code} ${error.message ?? ''}");
+    } catch (error) {
+      print("❌ ERROR: $error");
     }
   }
 
@@ -8067,14 +12458,36 @@ class _AddressSearchScreenState extends State<AddressSearchScreen> {
 }
 
 class TradeStoreScreen extends StatelessWidget {
+  const TradeStoreScreen({super.key});
+
+  String lockedCartMessage(String cartTrade) {
+    return "$cartTrade cart must be empty before shopping for another trade.";
+  }
+
   Widget tradeCard(
     BuildContext context,
     String trade,
     IconData icon,
     Color color,
+    String? cartTrade,
   ) {
+    final isLocked = cartTrade != null && cartTrade != trade;
+    final cardColor = isLocked ? Colors.grey : color;
+
     return GestureDetector(
       onTap: () {
+        if (isLocked) {
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(
+              SnackBar(
+                duration: Duration(seconds: 4),
+                content: Text(lockedCartMessage(cartTrade!)),
+              ),
+            );
+          return;
+        }
+
         if (trade == "Plumbing") {
           Navigator.push(
             context,
@@ -8097,9 +12510,9 @@ class TradeStoreScreen extends StatelessWidget {
         margin: EdgeInsets.only(bottom: 16),
         padding: EdgeInsets.all(20),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.15),
+          color: cardColor.withOpacity(isLocked ? 0.12 : 0.15),
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: color, width: 2),
+          border: Border.all(color: cardColor, width: 2),
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.05),
@@ -8110,7 +12523,7 @@ class TradeStoreScreen extends StatelessWidget {
         ),
         child: Row(
           children: [
-            Icon(icon, size: 36, color: color),
+            Icon(icon, size: 36, color: cardColor),
 
             SizedBox(width: 20),
 
@@ -8119,13 +12532,16 @@ class TradeStoreScreen extends StatelessWidget {
               style: TextStyle(
                 fontSize: 22,
                 fontWeight: FontWeight.bold,
-                color: color,
+                color: cardColor,
               ),
             ),
 
             Spacer(),
 
-            Icon(Icons.arrow_forward_ios, color: color),
+            Icon(
+              isLocked ? Icons.lock_outline : Icons.arrow_forward_ios,
+              color: cardColor,
+            ),
           ],
         ),
       ),
@@ -8134,36 +12550,64 @@ class TradeStoreScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
     return Scaffold(
       appBar: AppBar(automaticallyImplyLeading: false, toolbarHeight: 0),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              "Choose Your Trade",
-              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: user == null
+            ? null
+            : FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .collection('cart')
+                  .snapshots(),
+        builder: (context, snapshot) {
+          String? cartTrade;
+
+          if (snapshot.hasData && snapshot.data!.docs.isNotEmpty) {
+            final firstCartItem =
+                snapshot.data!.docs.first.data() as Map<String, dynamic>;
+            cartTrade = firstCartItem["tradeType"] as String? ?? "Plumbing";
+          }
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  "Choose Your Trade",
+                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 40),
+                tradeCard(
+                  context,
+                  "Plumbing",
+                  Icons.plumbing,
+                  Colors.blue,
+                  cartTrade,
+                ),
+                SizedBox(height: 20),
+                tradeCard(
+                  context,
+                  "Electrical",
+                  Icons.electrical_services,
+                  Colors.green,
+                  cartTrade,
+                ),
+                SizedBox(height: 20),
+                tradeCard(
+                  context,
+                  "HVAC",
+                  Icons.ac_unit,
+                  Colors.orange,
+                  cartTrade,
+                ),
+              ],
             ),
-
-            SizedBox(height: 40),
-
-            tradeCard(context, "Plumbing", Icons.plumbing, Colors.blue),
-
-            SizedBox(height: 20),
-
-            tradeCard(
-              context,
-              "Electrical",
-              Icons.electrical_services,
-              Colors.green,
-            ),
-
-            SizedBox(height: 20),
-
-            tradeCard(context, "HVAC", Icons.ac_unit, Colors.orange),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
@@ -8187,6 +12631,7 @@ class PlumbingScreen extends StatefulWidget {
 class _PlumbingScreenState extends State<PlumbingScreen>
     with SingleTickerProviderStateMixin {
   final List<Map<String, dynamic>> parts = [
+    /*
     {
       "name": "8 oz. Lead-Free Solder Wire",
       "price": 48.00,
@@ -8265,6 +12710,14 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "plumbingTools",
     },
     {
+      "name": "Thread Seal Tape",
+      "price": 13.00,
+      "description":
+          "Tape for sealing water connections commonly known as teflon tape (Brand may vary)",
+      "image": "assets/images/TeflonTape.jpg",
+      "categories": ["Tape"],
+    },
+    {
       "name": "2 in. Copper Pressure Coupling With Stop",
       "price": 5.00,
       "description":
@@ -8279,7 +12732,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper coupling for connecting 2 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperSlipCoupling.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8288,7 +12741,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper coupling for propress connecting 2 in. pipe with internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressNonSlipCoupling.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "propress",
     },
     {
@@ -8297,7 +12750,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper coupling for propress connecting 2 in. pipe without internal stops (Brand may vary)",
       "image": "assets/images/CopperProPressSlipCoupling.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "propress",
     },
     {
@@ -8306,7 +12759,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper all cup tee fitting for connecting 2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperTee.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8315,7 +12768,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper tee fitting for connecting 2 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPressTee.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "propress",
     },
     {
@@ -8324,7 +12777,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 45-degree fitting for connecting 2 in. pipe (Brand may vary)",
       "image": "assets/images/Copper45.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8333,7 +12786,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 45-degree fitting with one male end for connecting 2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet45.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8342,7 +12795,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 45-degree fitting for connecting 2 in. pipe with propress (Brand may vary)",
       "image": "assets/images/CopperProPress45.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "propress",
     },
     {
@@ -8351,7 +12804,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 90-degree Non-slip fitting for connecting 2 in. pipe (Brand may vary)",
       "image": "assets/images/Copper90.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8360,7 +12813,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 90-degree street fitting for connecting 2 in. pipe (Brand may vary)",
       "image": "assets/images/CopperStreet90.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8369,7 +12822,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "Copper 90-degree fitting for connecting 2 in. pipe with propress(Brand may vary)",
       "image": "assets/images/CopperProPress90.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "propress",
     },
     /*{
@@ -8386,7 +12839,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "2 in. Copper female to Male Pipe Thread adapter (Brand may vary)",
       "image": "assets/images/CopperFemaleToMPT.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8394,7 +12847,16 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 3.00,
       "description": "2 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
-      "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "categories": ["Copper Fittings"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "2 in. Copper Tube Strap",
+      "price": 3.00,
+      "description":
+          "2 in. copper strap for fastening copper pipe (Brand may vary)",
+      "image": "assets/images/CopperTubeStrap.jpg",
+      "categories": ["Straps/Hangers"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8402,7 +12864,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 15.00,
       "description": "2 in. brass threaded cap (Brand may vary)",
       "image": "assets/images/BrassCap.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8410,7 +12872,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 17.00,
       "description": "2 in. brass threaded coupling (Brand may vary)",
       "image": "assets/images/BrassCoupling.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8418,7 +12880,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 42.00,
       "description": "2 in. brass threaded elbow fitting (Brand may vary)",
       "image": "assets/images/Brass90.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8426,7 +12888,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 24.00,
       "description": "1 in. brass threaded 45 fitting (Brand may vary)",
       "image": "assets/images/Brass45.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8435,7 +12897,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "2 in. brass threaded street elbow fitting (Brand may vary)",
       "image": "assets/images/BrassStreet90.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8443,7 +12905,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 31.50,
       "description": "2 in. brass threaded street 45 fitting (Brand may vary)",
       "image": "assets/images/BrassStreet45.jpg",
-      "categories": ["Brass", "Bathroom", "Kitchen"],
+      "categories": ["Brass"],
       "specialtyStoreTag": "brassFittings",
     },
     {
@@ -8452,7 +12914,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "2 Full port brass ball valve with threading on both ends (Brand may vary)",
       "image": "assets/images/ThreadedBallValve.jpg",
-      "categories": ["Valves", "Bathroom", "Kitchen"],
+      "categories": ["Valves"],
       "specialtyStoreTag": "valves",
     },
     {
@@ -8461,7 +12923,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description":
           "1 Full port brass ball valve with female port on both ends (Brand may very)",
       "image": "assets/images/NonThreadedBallValve.jpg",
-      "categories": ["Valves", "Bathroom", "Kitchen"],
+      "categories": ["Valves"],
       "specialtyStoreTag": "valves",
     },
     {
@@ -8595,6 +13057,15 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "1 in. Copper Tube Strap",
+      "price": 3.00,
+      "description":
+          "1 in. copper strap for fastening copper pipe (Brand may vary)",
+      "image": "assets/images/CopperTubeStrap.jpg",
+      "categories": ["Straps/Hangers"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -8798,6 +13269,15 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "copperFittings",
     },
     {
+      "name": "3/4 in. Copper Tube Strap",
+      "price": 3.00,
+      "description":
+          "3/4 in. copper strap for fastening copper pipe (Brand may vary)",
+      "image": "assets/images/CopperTubeStrap.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
       "name": "3/4 in. Brass Cap",
       "price": 9.50,
       "description": "3/4 in. brass threaded cap (Brand may vary)",
@@ -8996,6 +13476,15 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "description": "1/2 in. Copper female threaded adapter (Brand may vary)",
       "image": "assets/images/CopperThreadedFemaleAdapter.jpg",
       "categories": ["Copper Fittings", "Bathroom", "Kitchen"],
+      "specialtyStoreTag": "copperFittings",
+    },
+    {
+      "name": "1/2 in. Copper Tube Strap",
+      "price": 3.00,
+      "description":
+          "1/2 in. copper strap for fastening copper pipe (Brand may vary)",
+      "image": "assets/images/CopperTubeStrap.jpg",
+      "categories": ["Straps/Hangers"],
       "specialtyStoreTag": "copperFittings",
     },
     {
@@ -9605,6 +14094,33 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "toiletRepair",
     },
     {
+      "name": "1 1/2 in. Flushometer Control Stop Valve",
+      "price": 76.00,
+      "description":
+          "1 in. valve that shuts off water supply to flushometer (Brand may very)",
+      "image": "assets/images/ControlStop1.5in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 in. Flushometer Control Stop Valve",
+      "price": 76.00,
+      "description":
+          "1 in. valve that shuts off water supply to flushometer (Brand may very)",
+      "image": "assets/images/ControlStop1in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "3/4 in. Flushometer Control Stop Valve",
+      "price": 76.00,
+      "description":
+          "3/4 in. valve that shuts off water supply to flushometer (Brand may very)",
+      "image": "assets/images/ControlStop.75in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
       "name": "Toilet Handle With Chain",
       "price": 12.00,
       "description":
@@ -9614,12 +14130,223 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "toiletRepair",
     },
     {
+      "name": "Universal Toilet Fill Valve",
+      "price": 15.00,
+      "description":
+          "Adjustable height *9-14 inches* toilet fill valve fits most standard toilets (Brand may very)",
+      "image": "assets/images/UniversalFillValve.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "Universal 3 in. Toilet Flush Valve",
+      "price": 15.00,
+      "description": "3 in. adjustable flush valve (Brand may very)",
+      "image": "assets/images/Universal3inFlushValve.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "Universal 2 in. Toilet Flush Valve",
+      "price": 15.00,
+      "description":
+          "2 in. adjustable flush valve with adapter for Gerber, and Kholer brand toilets (Brand may very)",
+      "image": "assets/images/Universal2inFlushValve.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
       "name": "Toilet Flapper",
       "price": 12.00,
-      "description": "Rubber flapper for toilet flush  (Brand may very)",
+      "description": "Rubber flapper for toilet flush (Brand may very)",
       "image": "assets/images/Flapper.jpg",
       "categories": ["Bathroom"],
       "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "3 in. Toilet Tank To Bowl Kit",
+      "price": 9.00,
+      "description":
+          "Kit that includes bowl gasket, 2 galvanized steel bolts, 4 galvanized steel nuts, and 4 galvanized steel washers with 4 rubber washers *Fits 3 in. flush valve* (Brand may very)",
+      "image": "assets/images/3inTankToBowlKit.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "2 in. Toilet Tank To Bowl Kit",
+      "price": 9.00,
+      "description":
+          "Kit that includes bowl gasket, 3 galvanized steel bolts, 6 galvanized steel nuts, and 6 galvanized steel washers with 6 rubber washers *Fits 2 in. flush valve* (Brand may very)",
+      "image": "assets/images/2inTankToBowlKit.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "Manual Flushometer (1 in. Inlet x 1 1/2 in. Spud Connection)",
+      "price": 9.00,
+      "description": "Chrome assembly flushometer for toilet (Brand may very)",
+      "image": "assets/images/RubberVacuumBreaker1.5in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 1/2 in. Rubber Vacuum Breaker",
+      "price": 9.00,
+      "description":
+          "A rubber diaphragm that seals and regulates airflow inside a flush valve vacuum breaker (Brand may very)",
+      "image": "assets/images/RubberVacuumBreaker1.5in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 1/4 in. Rubber Vacuum Breaker",
+      "price": 9.00,
+      "description":
+          "A rubber diaphragm that seals and regulates airflow inside a flush valve vacuum breaker (Brand may very)",
+      "image": "assets/images/RubberVacuumBreaker1.25in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 in. Rubber Vacuum Breaker",
+      "price": 9.00,
+      "description":
+          "A rubber diaphragm that seals and regulates airflow inside a flush valve vacuum breaker (Brand may very)",
+      "image": "assets/images/RubberVacuumBreaker1in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "3/4 in. Rubber Vacuum Breaker",
+      "price": 9.00,
+      "description":
+          "A rubber diaphragm that seals and regulates airflow inside a flush valve vacuum breaker (Brand may very)",
+      "image": "assets/images/RubberVacuumBreaker.75in.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "2 in. x 2 in. Spud",
+      "price": 9.00,
+      "description":
+          "Spud fitting for connecting porcelain to flushometer (Brand may very)",
+      "image": "assets/images/Spud2x2.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 1/2 in. x 1 1/2 in. Spud",
+      "price": 9.00,
+      "description":
+          "Spud fitting for connecting porcelain to flushometer (Brand may very)",
+      "image": "assets/images/Spud1.5x1.5.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "1 1/4 in. x 1 1/4 in. Spud",
+      "price": 9.00,
+      "description":
+          "Spud fitting for connecting porcelain to flushometer (Brand may very)",
+      "image": "assets/images/Spud1.25x1.25.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "3/4 in. x 3/4 in. Spud",
+      "price": 9.00,
+      "description":
+          "Spud fitting for connecting porcelain to flushometer (Brand may very)",
+      "image": "assets/images/Spud.75x.75.jpg",
+      "categories": ["Bathroom"],
+      "specialtyStoreTag": "toiletRepair",
+    },
+    {
+      "name": "Garden Hose",
+      "price": 12.00,
+      "description": "Standard 3/4 in. GHT 50 ft. Hose (Brand may very)",
+      "image": "assets/images/50ft.GardenHose.jpg",
+      "categories": ["Hoses"],
+      "specialtyStoreTag": "Plumbing",
+    },
+    {
+      "name": "Pipe Dope (8 oz.)",
+      "price": 7.00,
+      "description":
+          "Paste for sealing pipe connections from leaks (Brand may very)",
+      "image": "assets/images/PipeDope.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "Plumbing",
+    },
+    {
+      "name": "Yellow Thread Seal Tape",
+      "price": 5.00,
+      "description":
+          "Yellow tape for sealing gas connections commonly known as teflon tape (Brand may very)",
+      "image": "assets/images/TeflonTape(Yellow).jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "Plumbing",
+    },
+    {
+      "name": "4 in. Black Iron Pipe Coupling",
+      "price": 2.50,
+      "description": "4 in. Black iron coupling for gas line (Brand may very)",
+      "image": "assets/images/BlackPipeCoupling.jpg",
+      "categories": ["Couplings", "Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe Cap",
+      "price": 2.50,
+      "description":
+          "4 in. Threaded black iron cap for gas line (Brand may very)",
+      "image": "assets/images/BlackPipeCap.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe 45 degree Elbow",
+      "price": 4.00,
+      "description":
+          "4 in. black iron 45 degree fitting for gas line (Brand may very)",
+      "image": "assets/images/BlackPipe45.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe 90 degree Elbow",
+      "price": 4.00,
+      "description":
+          "4 in. black iron 90 degree elbow for gas line (Brand may very)",
+      "image": "assets/images/BlackPipe90.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe Nipple",
+      "price": 2.50,
+      "description": "4 in. black steel nipple for gas line (Brand may very)",
+      "image": "assets/images/BlackPipeNipple.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe Tee",
+      "price": 2.50,
+      "description":
+          "4 in. black iron tee for connecting threaded steel pipe (Brand may very)",
+      "image": "assets/images/BlackPipeTee.jpg",
+      "categories": ["Gas", "Black Steel Pipe"],
+      "specialtyStoreTag": "blackIron",
+    },
+    {
+      "name": "4 in. Black Iron Pipe Union Fiting",
+      "price": 11.00,
+      "description":
+          "4 in. black iron Union fitting for connecting two threaded steel pipes (Brand may very)",
+      "image": "assets/images/BlackPipeUnion.jpg",
+      "categories": ["Gas", "Black Steel Pipe", "Fittings"],
+      "specialtyStoreTag": "blackIron",
     },
     {
       "name": "3 in. Black Iron Pipe Coupling",
@@ -10003,7 +14730,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "blackIron",
     },
     {
-      "name": "1/2 in. Black Iron Pipe Cap",
+      "name": "3/4 in. Black Iron Pipe Cap",
       "price": 2.50,
       "description":
           "3/4 in. Threaded black iron cap for gas line (Brand may very)",
@@ -11031,103 +15758,31 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "blackIron",
     },
     {
-      "name": "3/4 in. to 1/2 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 3/4 in. to 1/2 in. pipe (Brand may very)",
-      "image": "assets/images/Black.75inTo.5inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "3/4 in. to 1/4 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 3/4 in. to 1/2 in. pipe (Brand may very)",
-      "image": "assets/images/Black.75inTo.25inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "3/4 in. to 1/8 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 3/4 in. to 1/8 in. pipe (Brand may very)",
-      "image": "assets/images/Black.75inTo.125inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "1/2 in. to 1/4 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 1/2 in. to 1/4 in. pipe (Brand may very)",
-      "image": "assets/images/Black.5inTo.25inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "1/2 in. to 1/8 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 1/2 in. to 1/8 in. pipe (Brand may very)",
-      "image": "assets/images/Black.5inTo.125inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "1/4 in. to 1/8 in. Black Iron Reducing Elbow",
-      "price": 11.00,
-      "description":
-          "Black iron elbow for reducing from 1/4 in. to 1/8 in. pipe (Brand may very)",
-      "image": "assets/images/Black.25inTo.125inElbow.jpg",
-      "categories": [
-        "Gas",
-        "Black Steel Pipe",
-        "Fittings",
-        "Elbows/90s",
-        "Reducers",
-      ],
-      "specialtyStoreTag": "blackIron",
-    },
-    {
-      "name": "Pipe Dope (8 oz.)",
+      "name": "2 in. Discharge Hose",
       "price": 7.00,
       "description":
-          "Paste for sealing pipe connections from leaks (Brand may very)",
-      "image": "assets/images/PipeDope.jpg",
-      "categories": ["Gas", "Black Steel Pipe"],
-      "specialtyStoreTag": "pipeSealants",
+          "2 in. 50 ft. discharge hose with male NPSM and female pin lug coupling (Brand may very)",
+      "image": "assets/images/50ft.2in.DischargeHose.jpg",
+      "categories": ["Hoses"],
+      "specialtyStoreTag": "Hoses",
+    },
+    {
+      "name": "2 in. Outlet Clear Water Sump Pump",
+      "price": 250.00,
+      "description":
+          "Clear water sump pump with 2 in. diameter outlet (Brand may very)",
+      "image": "assets/images/2in.DischargeHose.jpg",
+      "categories": ["Pumps", "Drains"],
+      "specialtyStoreTag": "SumpPumps",
+    },
+    {
+      "name": "2 in. Outlet Sewage Ejector Pump",
+      "price": 350.00,
+      "description":
+          "Sewage Ejector pump with 2 in. diameter outlet (Brand may very)",
+      "image": "assets/images/2in.SewageEjectorPump.jpg",
+      "categories": ["Pumps", "Drains"],
+      "specialtyStoreTag": "SumpPumps",
     },
     {
       "name": "4 in. Rubber Gasket",
@@ -11402,6 +16057,85 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "name": "No Hub 2 in. Wye",
       "price": 29.00,
       "description": "2 in. Cast iron wye (Brand may very)",
+      "image": "assets/images/NoHubWye.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "1 1/2 in. Shielded Rubber Coupling",
+      "price": 12.00,
+      "description":
+          "1 1/2 in. Rubber coupling for conneting drain pipe(Brand may very)",
+      "image": "assets/images/Shielded2inRubberCoupling.jpg",
+      "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "1 1/2 in. Heavy Duty Shielded Rubber Coupling",
+      "price": 11.00,
+      "description":
+          "1 1/2 in. Shielded rubber coupling for conneting drain pipe(Brand may very)",
+      "image": "assets/images/HeavyDutyRubberCoupling(2inOrLower).jpg",
+      "categories": ["PVC", "Drains", "NoHub"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "1 1/2 in. Rubber Cap",
+      "price": 5.00,
+      "description":
+          "1 1/2 in. rubber cap for PVC or Cast iron pipe (Brand may very)",
+      "image": "assets/images/RubberCap.jpg",
+      "categories": ["NoHub", "Drains", "PVC"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2 in. 45",
+      "price": 16.50,
+      "description": "1 1/2 in. Cast iron 45 (Brand may very)",
+      "image": "assets/images/NoHub45.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2 in. Cleanout",
+      "price": 28.50,
+      "description":
+          "1 1/2 in. Cast iron cleanout without cap (Brand may very)",
+      "image": "assets/images/NoHubCleanout.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2 in. Sanitary Tee",
+      "price": 24.00,
+      "description":
+          "1 1/2 in. Cast iron santary tee for drain piping (Brand may very)",
+      "image": "assets/images/NoHubSanitaryTee.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2  in. Long Sweep Elbow",
+      "price": 49.50,
+      "description":
+          "1 1/2 in. Cast iron elbow with a large bend for better flow (Brand may very)",
+      "image": "assets/images/NoHubLongSweepElbow.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2 in. Short Sweep Elbow",
+      "price": 31.50,
+      "description":
+          "1 1/2 in. Cast iron elbow with a slighly larger bend for better flow (Brand may very)",
+      "image": "assets/images/NoHubShortSweepElbow.jpg",
+      "categories": ["NoHub", "Drains"],
+      "specialtyStoreTag": "noHub",
+    },
+    {
+      "name": "No Hub 1 1/2 in. Wye",
+      "price": 29.00,
+      "description": "1 1/2 in. Cast iron wye (Brand may very)",
       "image": "assets/images/NoHubWye.jpg",
       "categories": ["NoHub", "Drains"],
       "specialtyStoreTag": "noHub",
@@ -11726,7 +16460,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "price": 5.00,
       "description":
           "PLastic bushing for reducing from 1 1/2in. drain pipe to 1 1/4in. trap/pipe (Brand may very)",
-      "image": "assets/images/PVCTailPipe.25.jpg",
+      "image": "assets/images/Plastic1.5inTo1.25inReducingBushing.jpg",
       "categories": ["PVC", "Drains"],
       "specialtyStoreTag": "generalPlumbing",
     },
@@ -11872,7 +16606,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "name": "Toilet/Closet Bolts",
       "price": 7.00,
       "description":
-          "Bolts, nuts, and washers for fastening toilet to toilet drain flange (Brand may very)",
+          "Bolts, nuts, and washers for fastening toilet to toilet drain flange, commonly known as johnny bolts (Brand may very)",
       "image": "assets/images/JonnyBolts.jpg",
       "categories": ["PVC", "Drains"],
       "specialtyStoreTag": "toiletRepair",
@@ -11950,6 +16684,348 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "specialtyStoreTag": "plumbingTools",
     },
     {
+      "name": "1/4 in. x 2 1/4 in. Concrete Anchor Screws (Pack of 8)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx2.25in(8Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 2 1/4 in. Concrete Anchor Screws (Pack of 25)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx2.25in(25Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 2 1/4 in. Concrete Anchor Screws (Pack of 75)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx2.25in(75Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 1/4 in. Concrete Anchor Screws (Pack of 8)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.25in(8Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 1/4 in. Concrete Anchor Screws (Pack of 25)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.25in(25Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 1/4 in. Concrete Anchor Screws (Pack of 75)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.25in(75Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 3/4 in. Concrete Anchor Screws (Pack of 8)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.75in(8Pack).jpg",
+      "categories": ["Tools", "Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 3/4 in. Concrete Anchor Screws (Pack of 25)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit not included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.75in(25Pack).jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. x 1 3/4 in. Concrete Anchor Screws (Pack of 75)",
+      "price": 11.00,
+      "description":
+          "Screws for fastening material to concrete *Bit included* (Brand may very)",
+      "image": "assets/images/ConcreteAnchorScrew.25inx1.75in(75Pack).jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "5/8 in. 11 Thread Count Drop-In Anchor",
+      "price": 11.00,
+      "description":
+          "Standard drop-in anchor for 5/8 in. threaded rod with 11 threads *7/8 in. masonry bit required for pilot hole* (Brand may very)",
+      "image": "assets/images/DropInAnchor.375-16.jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/2 in. 13 Thread Count Drop-In Anchor",
+      "price": 11.00,
+      "description":
+          "Standard drop-in anchor for 1/2 in. threaded rod with 13 threads *5/8 in. masonry bit required for pilot hole* (Brand may very)",
+      "image": "assets/images/DropInAnchor.5-13.jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "3/8 in. 16 Thread Count Drop-In Anchor",
+      "price": 11.00,
+      "description":
+          "Standard drop-in anchor for 3/8 in. threaded rod with 16 threads *1/2 in. masonry bit required for pilot hole* (Brand may very)",
+      "image": "assets/images/DropInAnchor.375-16.jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. 20 Thread Count Drop-In Anchor",
+      "price": 11.00,
+      "description":
+          "Standard drop-in anchor for 1/4 in. threaded rod with 20 threads *3/8 in. masonry bit required for pilot hole* (Brand may very)",
+      "image": "assets/images/DropInAnchor.25-20.jpg",
+      "categories": ["Anchors/Fasteners"],
+      "specialtyStoreTag": "plumbingTools",
+    },
+    {
+      "name": "1/4 in. Threaded Rod (1 ft.)",
+      "price": 4.00,
+      "description": "1/4 in. 1 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.25in(1Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/4 in. Threaded Rod (2 ft.)",
+      "price": 4.00,
+      "description": "1/4 in. 2 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.25in(2Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/4 in. Threaded Rod (3 ft.)",
+      "price": 4.00,
+      "description": "1/4 in. 3 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.25in(3Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/4 in. Threaded Rod (6 ft.)",
+      "price": 4.00,
+      "description": "1/4 in. 6 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.25in(6Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Threaded Rod (1 ft.)",
+      "price": 4.00,
+      "description": "1/2 in. 1 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.5in(1Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Threaded Rod (2 ft.)",
+      "price": 4.00,
+      "description": "1/2 in. 2 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.5in(2Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Threaded Rod (3 ft.)",
+      "price": 4.00,
+      "description": "1/2 in. 3 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.5in(3Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Threaded Rod (6 ft.)",
+      "price": 4.00,
+      "description": "1/2 in. 6 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.5in(6Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Threaded Rod (1 ft.)",
+      "price": 4.00,
+      "description": "3/8 in. 1 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.375in(1Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Threaded Rod (2 ft.)",
+      "price": 4.00,
+      "description": "3/8 in. 2 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.375in(2Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Threaded Rod (3 ft.)",
+      "price": 4.00,
+      "description": "3/8 in. 3 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.375in(3Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Threaded Rod (6 ft.)",
+      "price": 4.00,
+      "description": "3/8 in. 6 foot long threaded rod (Brand may very)",
+      "image": "assets/images/ThreadedRod.375in(6Foot).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/4 in. Hex Nut (Zinc Plated)",
+      "price": 0.50,
+      "description": "1/4 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/HexNut.25in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Hex Nut (Zinc Plated)",
+      "price": 0.50,
+      "description": "1/2 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/HexNut.5in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Hex Nut (Zinc Plated)",
+      "price": 0.50,
+      "description": "3/8 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/HexNut.375in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/4 in. Washer (Zinc Plated)",
+      "price": 0.50,
+      "description": "1/4 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/Washer.25in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Washer (Zinc Plated)",
+      "price": 0.50,
+      "description": "1/2 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/Washer.5in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/8 in. Washer (Zinc Plated)",
+      "price": 0.50,
+      "description": "3/8 in. zinc plated nut (Brand may very)",
+      "image": "assets/images/Washer.375in(Zinc).jpg",
+      "categories": ["Straps/Hangers", "Threaded Rod"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "4 in. Clevis Hanger",
+      "price": 10.00,
+      "description":
+          "4 in. clevis hanger for 1/2 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3 in. Clevis Hanger",
+      "price": 7.50,
+      "description":
+          "3 in. clevis hanger for 1/2 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "2 1/2 in. Clevis Hanger",
+      "price": 5.50,
+      "description":
+          "2 1/2 in. clevis hanger for 1/2 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "2 in. Clevis Hanger",
+      "price": 5.50,
+      "description":
+          "2 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1 1/2 in. Clevis Hanger",
+      "price": 4.00,
+      "description":
+          "1 1/2 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1 1/4 in. Clevis Hanger",
+      "price": 4.00,
+      "description":
+          "1 1/4 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1 in. Clevis Hanger",
+      "price": 4.00,
+      "description":
+          "1 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "3/4 in. Clevis Hanger",
+      "price": 3.50,
+      "description":
+          "3/4 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
+      "name": "1/2 in. Clevis Hanger",
+      "price": 4.00,
+      "description":
+          "1/2 in. clevis hanger for 3/8 in. threaded rod (Brand may very)",
+      "image": "assets/images/ClevisHanger.jpg",
+      "categories": ["Straps/Hangers"],
+      "specialtyStoreTag": "Straps/Hangers",
+    },
+    {
       "name": "Pipe Wrench (14 in.)",
       "price": 45.00,
       "description": "Heavy-duty wrench for gripping pipes (Brand may very)",
@@ -11957,6 +17033,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
       "categories": ["Tools"],
       "specialtyStoreTag": "plumbingTools",
     },
+    */
   ];
 
   List<CartItem> cart = [];
@@ -11968,6 +17045,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
   String selectedCategory = "All";
 
   bool showAddedMessage = false;
+  final ScrollController _partsScrollController = ScrollController();
 
   Future<void> saveOrderToFirebase(Map<String, dynamic> order) async {
     final user = FirebaseAuth.instance.currentUser;
@@ -12026,6 +17104,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
     List<String> cartItems = cart
         .map(
           (item) => jsonEncode({
+            "itemId": item.itemId,
             "name": item.name,
             "price": item.price,
             "image": item.image,
@@ -12048,6 +17127,9 @@ class _PlumbingScreenState extends State<PlumbingScreen>
           final decoded = jsonDecode(item);
 
           return CartItem(
+            itemId:
+                decoded["itemId"]?.toString() ??
+                catalogItemIdForTrade("Plumbing", decoded["name"] ?? ""),
             name: decoded["name"],
             price: decoded["price"],
             image: decoded["image"],
@@ -12062,37 +17144,7 @@ class _PlumbingScreenState extends State<PlumbingScreen>
   }
 
   Future<void> addToCart(Map<String, dynamic> item, [int qty = 1]) async {
-    final user = FirebaseAuth.instance.currentUser;
-
-    final docRef = FirebaseFirestore.instance
-        .collection('users')
-        .doc(user!.uid)
-        .collection('cart')
-        .doc(item["name"]);
-
-    final doc = await docRef.get();
-
-    if (doc.exists) {
-      // 🔁 Increase quantity
-      final currentQty = doc["quantity"] ?? 1;
-
-      await docRef.update({
-        "quantity": currentQty + qty,
-        requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
-      });
-    } else {
-      // ➕ New item
-      await docRef.set({
-        "name": item["name"],
-        "price": item["price"],
-        "image": item["image"],
-        "description": item["description"],
-        "quantity": qty,
-        "specialtyStoreTag": item["specialtyStoreTag"],
-        requiresCarDeliveryKey: item[requiresCarDeliveryKey] == true,
-      });
-    }
-
+    await addTradeItemToCart(item, tradeType: "Plumbing", quantity: qty);
     showAddedToCartMessage();
   }
 
@@ -12122,14 +17174,19 @@ class _PlumbingScreenState extends State<PlumbingScreen>
     ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOut));
   }
 
+  @override
   void dispose() {
     _controller.dispose();
+    _partsScrollController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    List<Map<String, dynamic>> filteredParts = parts.where((item) {
+    final catalogParts = plumbingCatalogParts.isNotEmpty
+        ? plumbingCatalogParts
+        : parts;
+    List<Map<String, dynamic>> filteredParts = catalogParts.where((item) {
       bool matchesSearch = item["name"].toLowerCase().contains(
         searchQuery.toLowerCase(),
       );
@@ -12197,6 +17254,16 @@ class _PlumbingScreenState extends State<PlumbingScreen>
                   Navigator.push(
                     context,
                     MaterialPageRoute(builder: (_) => AddressSearchScreen()),
+                  );
+                },
+              ),
+              ListTile(
+                leading: Icon(Icons.help_outline),
+                title: Text("Help"),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => CustomerHelpScreen()),
                   );
                 },
               ),
@@ -12413,57 +17480,62 @@ class _PlumbingScreenState extends State<PlumbingScreen>
               ),
 
               Expanded(
-                child: GridView.builder(
-                  padding: EdgeInsets.all(10),
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 2,
-                    childAspectRatio: 0.75,
-                    crossAxisSpacing: 10,
-                    mainAxisSpacing: 10,
-                  ),
-                  itemCount: filteredParts.length,
-                  itemBuilder: (context, index) {
-                    return GestureDetector(
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) => DetailScreen(
-                              name: filteredParts[index]["name"],
-                              price: filteredParts[index]["price"],
-                              description: filteredParts[index]["description"],
-                              image: filteredParts[index]["image"],
-                              onAdd: (qty) {
-                                addToCart(filteredParts[index], qty);
-                              },
-                            ),
-                          ),
-                        );
-                      },
-                      child: Card(
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: Column(
-                          children: [
-                            Expanded(
-                              child: Image.asset(
-                                filteredParts[index]["image"],
-                                fit: BoxFit.cover,
+                child: PartsScrollRail(
+                  controller: _partsScrollController,
+                  child: GridView.builder(
+                    controller: _partsScrollController,
+                    padding: EdgeInsets.fromLTRB(10, 10, 34, 10),
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      childAspectRatio: 0.75,
+                      crossAxisSpacing: 10,
+                      mainAxisSpacing: 10,
+                    ),
+                    itemCount: filteredParts.length,
+                    itemBuilder: (context, index) {
+                      return GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (context) => DetailScreen(
+                                name: filteredParts[index]["name"],
+                                price: filteredParts[index]["price"],
+                                description:
+                                    filteredParts[index]["description"],
+                                image: filteredParts[index]["image"],
+                                onAdd: (qty) {
+                                  addToCart(filteredParts[index], qty);
+                                },
                               ),
                             ),
-                            Padding(
-                              padding: EdgeInsets.all(8),
-                              child: Text(filteredParts[index]["name"]),
-                            ),
-                            Text(
-                              "\$${(filteredParts[index]["price"] as num).toDouble().toStringAsFixed(2)}",
-                            ),
-                          ],
+                          );
+                        },
+                        child: Card(
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Column(
+                            children: [
+                              Expanded(
+                                child: Image.asset(
+                                  filteredParts[index]["image"],
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                              Padding(
+                                padding: EdgeInsets.all(8),
+                                child: Text(filteredParts[index]["name"]),
+                              ),
+                              Text(
+                                "\$${(filteredParts[index]["price"] as num).toDouble().toStringAsFixed(2)}",
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
-                    );
-                  },
+                      );
+                    },
+                  ),
                 ),
               ),
             ],
